@@ -12,7 +12,12 @@ where Pritam's own words are kept).
 
 ## Open
 
-Nothing open.
+- [ ] **Links must open on the web.** Pritam reads bb remotely, so a link to
+  a file on the host (`/home/…`, `~/…`) doesn't open for him, and agents
+  keep adding them. `waiting_add`, `bb waiting add` and `bb waiting edit`
+  should refuse a local path with a clear message (publish it with
+  `omni-media`, or link GitHub or the dev site), and the card should flag any
+  existing item whose link is a path. 2026-10-16, R-104.
 
 ## Proposed (ours, waiting on Pritam's yes)
 

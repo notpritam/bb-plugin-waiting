@@ -5,6 +5,10 @@
 //    Uncommitted cards: "Waiting on you · 3", expanding into a check-mark list.
 // 2. A "Waiting on you" section on the home screen with every open item
 //    across threads and projects.
+//
+// Each row: tick it done; tap a choice to answer (the answer goes to the
+// item's thread as the user's message); or, from the row's menu, "Do now",
+// "Next", "Later" (tomorrow, next week, a date) and "Reply…" in the card.
 import {
   useCallback,
   useEffect,
@@ -24,12 +28,20 @@ import {
   useRealtimeConnectionState,
   useRpc,
 } from "@get-bb/plugin-sdk/app";
-import type { Item, ItemLink, ThreadInfo, rpcContract } from "./server";
+import type { Item, ItemAction, ItemLink, ThreadInfo, rpcContract } from "./server";
 import {
   activityRowClass,
   activityTextClass,
 } from "@/components/ui/activity-row-styles";
 import { Checkbox } from "@/components/ui/checkbox";
+import {
+  DropdownMenu,
+  DropdownMenuContent,
+  DropdownMenuItem,
+  DropdownMenuLabel,
+  DropdownMenuSeparator,
+  DropdownMenuTrigger,
+} from "@/components/ui/dropdown-menu";
 import { Icon } from "@/components/ui/icon";
 import {
   PROMPT_STACK_DISCLOSURE_TRIGGER_CLASS,
@@ -48,13 +60,23 @@ const CARD_HEADER_BUTTON_CLASS =
   "flex min-h-8 w-full min-w-0 cursor-pointer items-center gap-1.5 rounded-none px-3 py-1.5 text-xs text-foreground transition-colors hover:bg-background/80";
 const LINK_PILL_CLASS =
   "inline-flex h-4 max-w-56 min-w-0 shrink-0 items-center gap-0.5 rounded-full bg-surface-recessed px-1.5 text-2xs leading-none text-subtle-foreground transition-colors hover:text-foreground";
+/** A choice reads as a button: outlined, foreground text. */
+const CHOICE_PILL_CLASS =
+  "inline-flex h-4 shrink-0 items-center rounded-full border border-border bg-background px-1.5 text-2xs font-medium leading-none text-foreground transition-colors hover:bg-state-hover disabled:pointer-events-none disabled:opacity-50";
+/** bb's row actions: hidden until the row is hovered or focused, always on touch. */
+const MORE_BUTTON_CLASS =
+  "inline-flex size-5 shrink-0 items-center justify-center rounded-md text-subtle-foreground opacity-0 transition-opacity hover:bg-state-hover hover:text-foreground focus-visible:opacity-100 group-hover:opacity-100 data-[state=open]:bg-state-active data-[state=open]:text-foreground data-[state=open]:opacity-100 [@media(hover:none)]:opacity-100";
 const FOLD_AWAY_MS = 450;
+/** Re-check "later" items at least this often while one is pending. */
+const MAX_RETURN_TIMER_MS = 60 * 60 * 1000;
+const LATER_HOUR = 9;
 
 // ---- data --------------------------------------------------------------
 
 interface WaitingData {
   items: Item[];
   threads: Record<string, ThreadInfo>;
+  returnsAt: number | null;
 }
 
 function useWaitingItems(threadId: string | null) {
@@ -76,16 +98,38 @@ function useWaitingItems(threadId: string | null) {
     if (seenConnected.current) refetch();
     seenConnected.current = true;
   }, [connection, refetch]);
-  const setDone = useCallback(
-    (id: number, done: boolean) =>
-      rpc.call("setDone", { id, done }).then(refetch, refetch),
-    [rpc, refetch],
+  // Items put off for later come back on their own.
+  const returnsAt = data?.returnsAt ?? null;
+  useEffect(() => {
+    if (returnsAt === null) return;
+    const delay = Math.min(Math.max(returnsAt - Date.now(), 0) + 500, MAX_RETURN_TIMER_MS);
+    const timer = setTimeout(refetch, delay);
+    return () => clearTimeout(timer);
+  }, [returnsAt, refetch]);
+  const settle = useCallback(
+    (call: Promise<unknown>) =>
+      call.then(
+        () => refetch(),
+        (error: unknown) => {
+          refetch();
+          throw error;
+        },
+      ),
+    [refetch],
   );
-  return { data, refetch, setDone };
+  const setDone = useCallback(
+    (id: number, done: boolean) => settle(rpc.call("setDone", { id, done })),
+    [rpc, settle],
+  );
+  const act = useCallback(
+    (id: number, action: ItemAction) => settle(rpc.call("act", { id, action })),
+    [rpc, settle],
+  );
+  return { data, setDone, act };
 }
 
 /** Items tick visibly, then fold away once the server confirms. */
-function useFoldAway(setDone: (id: number, done: boolean) => Promise<void>) {
+function useFoldAway() {
   const [ticked, setTicked] = useState<ReadonlySet<number>>(new Set());
   const timers = useRef(new Map<number, ReturnType<typeof setTimeout>>());
   useEffect(() => {
@@ -95,38 +139,84 @@ function useFoldAway(setDone: (id: number, done: boolean) => Promise<void>) {
       pending.clear();
     };
   }, []);
-  const tick = useCallback(
-    (id: number, done: boolean) => {
-      setTicked((previous) => {
-        const next = new Set(previous);
-        if (done) next.add(id);
-        else next.delete(id);
-        return next;
-      });
-      const existing = timers.current.get(id);
-      if (existing !== undefined) clearTimeout(existing);
-      if (!done) {
-        void setDone(id, false);
-        return;
+  const untick = (id: number) =>
+    setTicked((previous) => {
+      if (!previous.has(id)) return previous;
+      const next = new Set(previous);
+      next.delete(id);
+      return next;
+    });
+  const fold = useCallback((id: number, run: () => Promise<void>) => {
+    setTicked((previous) => new Set(previous).add(id));
+    const existing = timers.current.get(id);
+    if (existing !== undefined) clearTimeout(existing);
+    timers.current.set(
+      id,
+      setTimeout(() => {
+        timers.current.delete(id);
+        void run().finally(() => untick(id));
+      }, FOLD_AWAY_MS),
+    );
+  }, []);
+  /** Cancel a pending fold; true when there was one. */
+  const unfold = useCallback((id: number): boolean => {
+    const timer = timers.current.get(id);
+    if (timer !== undefined) {
+      clearTimeout(timer);
+      timers.current.delete(id);
+    }
+    untick(id);
+    return timer !== undefined;
+  }, []);
+  return { ticked, fold, unfold };
+}
+
+type RowAction = ItemAction | { kind: "done"; done: boolean } | { kind: "reply" };
+
+const FAILED = "Didn't go through. Try again, or reply in the thread.";
+
+/** Routes a row's actions: ticks and answers fold away, later/next just refetch. */
+function useRowActions(
+  setDone: (id: number, done: boolean) => Promise<void>,
+  act: (id: number, action: ItemAction) => Promise<void>,
+  reply?: (item: Item) => void,
+) {
+  const { ticked, fold, unfold } = useFoldAway();
+  const [errors, setErrors] = useState<ReadonlyMap<number, string>>(new Map());
+  const run = useCallback((id: number, task: () => Promise<void>) => {
+    setErrors((previous) => {
+      if (!previous.has(id)) return previous;
+      const next = new Map(previous);
+      next.delete(id);
+      return next;
+    });
+    return task().catch(() => {
+      setErrors((previous) => new Map(previous).set(id, FAILED));
+    });
+  }, []);
+  const onAct = useCallback(
+    (item: Item, action: RowAction) => {
+      switch (action.kind) {
+        case "done":
+          if (action.done) fold(item.id, () => run(item.id, () => setDone(item.id, true)));
+          else if (!unfold(item.id)) void run(item.id, () => setDone(item.id, false));
+          return;
+        case "answer":
+        case "doNow":
+          fold(item.id, () => run(item.id, () => act(item.id, action)));
+          return;
+        case "later":
+        case "next":
+          void run(item.id, () => act(item.id, action));
+          return;
+        case "reply":
+          reply?.(item);
+          return;
       }
-      timers.current.set(
-        id,
-        setTimeout(() => {
-          timers.current.delete(id);
-          void setDone(id, true).finally(() => {
-            setTicked((previous) => {
-              if (!previous.has(id)) return previous;
-              const next = new Set(previous);
-              next.delete(id);
-              return next;
-            });
-          });
-        }, FOLD_AWAY_MS),
-      );
     },
-    [setDone],
+    [act, fold, reply, run, setDone, unfold],
   );
-  return { ticked, tick };
+  return { ticked, errors, onAct };
 }
 
 // ---- small pieces ------------------------------------------------------
@@ -165,6 +255,45 @@ function relativeTime(at: number, now = Date.now()): string {
     day: "numeric",
     month: "short",
   });
+}
+
+/** Later times land at 9 in the morning, in the browser's time zone. */
+function atLaterHour(date: Date): number {
+  const next = new Date(date);
+  next.setHours(LATER_HOUR, 0, 0, 0);
+  return next.getTime();
+}
+
+function tomorrow(): number {
+  const date = new Date();
+  date.setDate(date.getDate() + 1);
+  return atLaterHour(date);
+}
+
+function nextMonday(): number {
+  const date = new Date();
+  const ahead = (8 - date.getDay()) % 7 || 7;
+  date.setDate(date.getDate() + ahead);
+  return atLaterHour(date);
+}
+
+function todayInputValue(): string {
+  const date = new Date();
+  const month = String(date.getMonth() + 1).padStart(2, "0");
+  const day = String(date.getDate()).padStart(2, "0");
+  return `${date.getFullYear()}-${month}-${day}`;
+}
+
+function fromDateInput(value: string): number | null {
+  const match = /^(\d{4})-(\d{2})-(\d{2})$/u.exec(value);
+  if (match === null) return null;
+  const date = new Date(
+    Number(match[1]),
+    Number(match[2]) - 1,
+    Number(match[3]),
+    LATER_HOUR,
+  );
+  return Number.isNaN(date.getTime()) ? null : date.getTime();
 }
 
 function linkLabel(link: ItemLink): string {
@@ -244,15 +373,112 @@ function ThreadPill({ threadId, title }: { threadId: string; title: string | nul
   );
 }
 
+/** "Pick a date…": opens the native date picker, hidden input and all. */
+function PickDateItem({ onPick }: { onPick: (until: number) => void }) {
+  const inputRef = useRef<HTMLInputElement>(null);
+  return (
+    <DropdownMenuItem
+      onSelect={(event) => {
+        event.preventDefault();
+        const input = inputRef.current;
+        if (input === null) return;
+        try {
+          input.showPicker();
+        } catch {
+          input.focus();
+        }
+      }}
+    >
+      <Icon name="Calendar" />
+      Pick a date…
+      <input
+        ref={inputRef}
+        type="date"
+        min={todayInputValue()}
+        tabIndex={-1}
+        aria-label="Date to come back on"
+        className="sr-only"
+        onChange={(event) => {
+          const until = fromDateInput(event.currentTarget.value);
+          if (until !== null) onPick(until);
+        }}
+      />
+    </DropdownMenuItem>
+  );
+}
+
+function RowMenu({
+  title,
+  disabled,
+  canReply,
+  onAct,
+}: {
+  title: string;
+  disabled: boolean;
+  canReply: boolean;
+  onAct: (action: RowAction) => void;
+}) {
+  const [open, setOpen] = useState(false);
+  const later = (until: number) => {
+    setOpen(false);
+    onAct({ kind: "later", until });
+  };
+  return (
+    <DropdownMenu open={open} onOpenChange={setOpen}>
+      <DropdownMenuTrigger asChild>
+        <button
+          type="button"
+          disabled={disabled}
+          aria-label={`More for "${title}"`}
+          className={MORE_BUTTON_CLASS}
+        >
+          <Icon name="MoreHorizontal" className="size-3.5" aria-hidden="true" />
+        </button>
+      </DropdownMenuTrigger>
+      <DropdownMenuContent align="end">
+        <DropdownMenuItem onSelect={() => onAct({ kind: "doNow" })}>
+          <Icon name="Play" />
+          Do now
+        </DropdownMenuItem>
+        <DropdownMenuItem onSelect={() => onAct({ kind: "next" })}>
+          <Icon name="ArrowUp" />
+          Next
+        </DropdownMenuItem>
+        {canReply ? (
+          <DropdownMenuItem onSelect={() => onAct({ kind: "reply" })}>
+            <Icon name="CornerDownLeft" />
+            Reply…
+          </DropdownMenuItem>
+        ) : null}
+        <DropdownMenuSeparator />
+        <DropdownMenuLabel>Later</DropdownMenuLabel>
+        <DropdownMenuItem onSelect={() => later(tomorrow())}>
+          <Icon name="Clock" />
+          Tomorrow
+        </DropdownMenuItem>
+        <DropdownMenuItem onSelect={() => later(nextMonday())}>
+          <Icon name="Clock" />
+          Next week
+        </DropdownMenuItem>
+        <PickDateItem onPick={later} />
+      </DropdownMenuContent>
+    </DropdownMenu>
+  );
+}
+
 function ItemRow({
   item,
   ticked,
-  onTick,
+  error,
+  onAct,
+  canReply,
   thread,
 }: {
   item: Item;
   ticked: boolean;
-  onTick: (done: boolean) => void;
+  error: string | undefined;
+  onAct: (action: RowAction) => void;
+  canReply: boolean;
   /** Shown only on the overview, where items come from many threads. */
   thread?: { id: string; title: string | null };
 }) {
@@ -266,13 +492,13 @@ function ItemRow({
     <li
       className={activityRowClass(
         state,
-        "flex min-w-0 items-start gap-2 text-xs transition-opacity",
+        "group flex min-w-0 items-start gap-2 text-xs transition-opacity",
       )}
     >
       <Checkbox
         id={checkboxId}
         checked={ticked}
-        onCheckedChange={(checked) => onTick(checked === true)}
+        onCheckedChange={(checked) => onAct({ kind: "done", done: checked === true })}
         aria-label={`Mark "${item.title}" ${ticked ? "not done" : "done"}`}
         className="mt-0.5"
       />
@@ -298,8 +524,26 @@ function ItemRow({
           {item.links.map((link, index) => (
             <LinkPill key={`${item.id}-${index}`} link={link} />
           ))}
+          {item.choices.map((choice) => (
+            <button
+              key={choice}
+              type="button"
+              disabled={ticked}
+              className={CHOICE_PILL_CLASS}
+              title={`Answer "${choice}" in the thread`}
+              onClick={() => onAct({ kind: "answer", answer: choice })}
+            >
+              {choice}
+            </button>
+          ))}
+          {error === undefined ? null : (
+            <span role="alert" className="text-2xs text-destructive">
+              {error}
+            </span>
+          )}
         </div>
       </div>
+      <RowMenu title={item.title} disabled={ticked} canReply={canReply} onAct={onAct} />
     </li>
   );
 }
@@ -381,8 +625,17 @@ function WaitingCard() {
   const composer = useComposer();
   const threadId = composer.scope.kind === "thread" ? composer.scope.threadId : null;
   const pluginId = usePluginId();
-  const { data, setDone } = useWaitingItems(threadId);
-  const { ticked, tick } = useFoldAway(setDone);
+  const { data, setDone, act } = useWaitingItems(threadId);
+  // "Reply…" starts the answer in this thread's composer.
+  const reply = useCallback(
+    (item: Item) => {
+      const lead = composer.text.trim() === "" ? "" : "\n";
+      composer.insert(`${lead}Re #${item.id} "${item.title}": `, { at: "end" });
+      composer.focus();
+    },
+    [composer],
+  );
+  const { ticked, errors, onAct } = useRowActions(setDone, act, reply);
   const [isExpanded, setExpanded] = useStoredExpanded(`${pluginId}:card-expanded`);
   const focus = useDisclosureFocusHandoff(isExpanded, () => setExpanded(!isExpanded));
   const items = data?.items ?? [];
@@ -428,7 +681,9 @@ function WaitingCard() {
               key={item.id}
               item={item}
               ticked={ticked.has(item.id)}
-              onTick={(done) => tick(item.id, done)}
+              error={errors.get(item.id)}
+              onAct={(action) => onAct(item, action)}
+              canReply
             />
           ))}
         </ul>
@@ -455,8 +710,8 @@ function groupByProject(items: readonly Item[]): [string, Item[]][] {
 }
 
 function Overview() {
-  const { data, setDone } = useWaitingItems(null);
-  const { ticked, tick } = useFoldAway(setDone);
+  const { data, setDone, act } = useWaitingItems(null);
+  const { ticked, errors, onAct } = useRowActions(setDone, act);
   if (data === null) return null;
   if (data.items.length === 0) {
     return (
@@ -479,7 +734,9 @@ function Overview() {
                 key={item.id}
                 item={item}
                 ticked={ticked.has(item.id)}
-                onTick={(done) => tick(item.id, done)}
+                error={errors.get(item.id)}
+                onAct={(action) => onAct(item, action)}
+                canReply={false}
                 thread={
                   item.threadId === null
                     ? undefined

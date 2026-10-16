@@ -4,6 +4,11 @@
 // its link. One SQLite table (store.ts); three ways in: RPC for the composer
 // card and the home overview, the `bb waiting` CLI, and `waiting_*` agent
 // tools. Every write publishes a realtime signal so open cards refetch.
+//
+// From the card the user can tick an item done, answer a question (its
+// choices as buttons; the answer goes to the item's thread as their
+// message), say "Do now" (same, the thread's agent goes ahead), put it off
+// for later, or move it up next.
 import { homedir } from "node:os";
 import {
   PluginCliError,
@@ -14,15 +19,22 @@ import {
 } from "@get-bb/plugin-sdk";
 import { z } from "zod";
 import {
+  MAX_CHOICES,
+  MAX_CHOICE_LENGTH,
   MIGRATIONS,
   WaitingStore,
+  answerMessage,
+  choicesSchema,
+  doNowMessage,
   formatItemLine,
   itemSchema,
+  normalizeChoices,
   parseItemId,
   parseLinkTarget,
   type DoneBy,
   type Item,
   type ItemLink,
+  type ItemPatch,
 } from "./store";
 
 export type { Item, ItemLink } from "./store";
@@ -32,6 +44,16 @@ const threadInfoSchema = z.object({
   projectId: z.string().nullable(),
 });
 export type ThreadInfo = z.infer<typeof threadInfoSchema>;
+
+const MAX_ANSWER = 400;
+
+export const actionSchema = z.discriminatedUnion("kind", [
+  z.object({ kind: z.literal("answer"), answer: z.string().min(1).max(MAX_ANSWER) }),
+  z.object({ kind: z.literal("doNow") }),
+  z.object({ kind: z.literal("later"), until: z.number().int().positive() }),
+  z.object({ kind: z.literal("next") }),
+]);
+export type ItemAction = z.infer<typeof actionSchema>;
 
 export const rpcContract = defineRpcContract({
   list: {
@@ -44,10 +66,16 @@ export const rpcContract = defineRpcContract({
     output: z.object({
       items: z.array(itemSchema),
       threads: z.record(z.string(), threadInfoSchema),
+      /** When the earliest "later" item comes back, so the card can refetch. */
+      returnsAt: z.number().nullable(),
     }),
   },
   setDone: {
     input: z.object({ id: z.number().int().positive(), done: z.boolean() }).strict(),
+    output: itemSchema,
+  },
+  act: {
+    input: z.object({ id: z.number().int().positive(), action: actionSchema }).strict(),
     output: itemSchema,
   },
 });
@@ -129,24 +157,16 @@ export default async function plugin(bb: BbPluginApi) {
     return primaryHostId();
   }
 
-  interface AddInput {
-    title: string;
-    needed: string | null;
-    linkTargets: readonly string[];
-    project: string | null;
-    requirement: string | null;
-    threadId: string | null;
-    projectId: string | null;
-  }
-
-  async function addItem(input: AddInput): Promise<Item> {
-    const title = input.title.trim().slice(0, MAX_TITLE);
-    if (title === "") throw new Error("title is required");
-    const hostId = await hostForThread(input.threadId);
+  /** Typed links from free-form targets; throws naming the ones that are not links. */
+  async function parseLinks(
+    targets: readonly string[],
+    threadId: string | null,
+  ): Promise<ItemLink[]> {
+    const hostId = await hostForThread(threadId);
     const serverHostId = await primaryHostId();
     const links: ItemLink[] = [];
     const bad: string[] = [];
-    for (const raw of input.linkTargets.slice(0, MAX_LINKS)) {
+    for (const raw of targets.slice(0, MAX_LINKS)) {
       const link = parseLinkTarget(raw, {
         hostId,
         homeDir: hostId !== null && hostId === serverHostId ? homedir() : null,
@@ -159,6 +179,24 @@ export default async function plugin(bb: BbPluginApi) {
         `not a link: ${bad.join(", ")} (use https://…, an absolute path, ~/… or thr_…)`,
       );
     }
+    return links;
+  }
+
+  interface AddInput {
+    title: string;
+    needed: string | null;
+    linkTargets: readonly string[];
+    choices: readonly string[];
+    project: string | null;
+    requirement: string | null;
+    threadId: string | null;
+    projectId: string | null;
+  }
+
+  async function addItem(input: AddInput): Promise<Item> {
+    const title = input.title.trim().slice(0, MAX_TITLE);
+    if (title === "") throw new Error("title is required");
+    const links = await parseLinks(input.linkTargets, input.threadId);
     let project = input.project?.trim() ?? "";
     if (project === "" && input.projectId !== null) {
       project = (await projectName(input.projectId)) ?? "";
@@ -168,6 +206,7 @@ export default async function plugin(bb: BbPluginApi) {
       title,
       needed: emptyToNull(input.needed?.slice(0, MAX_NEEDED) ?? null),
       links,
+      choices: normalizeChoices(input.choices),
       threadId: input.threadId,
       projectId: input.projectId,
       project: emptyToNull(project),
@@ -183,6 +222,43 @@ export default async function plugin(bb: BbPluginApi) {
     return item;
   }
 
+  /** The user's message into the item's thread, so its agent acts on it. */
+  async function sendToThread(item: Item, text: string): Promise<void> {
+    if (item.threadId === null) {
+      throw new Error(`#${item.id} has no thread to send the answer to`);
+    }
+    await bb.sdk.threads.send({
+      threadId: item.threadId,
+      mode: "auto",
+      input: [{ type: "text", text, mentions: [] }],
+    });
+  }
+
+  async function actOn(id: number, action: z.infer<typeof actionSchema>): Promise<Item> {
+    const item = store.get(id);
+    if (item === null) throw new Error(`No item #${id}`);
+    let updated: Item | null;
+    switch (action.kind) {
+      case "answer":
+        await sendToThread(item, answerMessage(item, action.answer));
+        updated = store.setDone(id, true, "user", Date.now(), action.answer);
+        break;
+      case "doNow":
+        await sendToThread(item, doNowMessage(item));
+        updated = store.setDoing(id);
+        break;
+      case "later":
+        updated = store.setLater(id, action.until);
+        break;
+      case "next":
+        updated = store.setNext(id);
+        break;
+    }
+    if (updated === null) throw new Error(`No item #${id}`);
+    changed();
+    return updated;
+  }
+
   async function threadsFor(items: readonly Item[]): Promise<Record<string, ThreadInfo>> {
     const entries = await Promise.all(
       WaitingStore.threadIds(items).map(
@@ -196,16 +272,24 @@ export default async function plugin(bb: BbPluginApi) {
 
   bb.rpc.register(rpcContract, {
     async list({ threadId, includeDone }) {
+      const scope = threadId ?? null;
       const items = store.list({
-        threadId: threadId ?? null,
+        threadId: scope,
         includeDone: includeDone ?? false,
       });
-      return { items, threads: await threadsFor(items) };
+      return {
+        items,
+        threads: await threadsFor(items),
+        returnsAt: store.returnsAt(scope),
+      };
     },
     setDone({ id, done }) {
       const item = markDone(id, done, "user");
       if (item === null) throw new Error(`No item #${id}`);
       return item;
+    },
+    act({ id, action }) {
+      return actOn(id, action);
     },
   });
 
@@ -214,6 +298,22 @@ export default async function plugin(bb: BbPluginApi) {
   const jsonOption = {
     type: "boolean",
     description: "Emit machine-readable JSON",
+  } as const;
+
+  const choiceOption = {
+    type: "string",
+    repeatable: true,
+    description: `A short answer the user can tap on the card, e.g. --choice Yes --choice No (up to ${MAX_CHOICES}, ${MAX_CHOICE_LENGTH} characters each)`,
+    aliases: ["choices", "option"],
+  } as const;
+
+  const linkOption = {
+    type: "string",
+    repeatable: true,
+    description:
+      "A link to open: https://…, an absolute path, ~/… or thr_… ; add a label with `target|Label`",
+    aliases: ["url", "links"],
+    placeholder: "target|label",
   } as const;
 
   function requireId(raw: string): number {
@@ -232,6 +332,13 @@ export default async function plugin(bb: BbPluginApi) {
       code: "not_found",
       hint: "Run `bb waiting list --all` to see every item.",
     });
+  }
+
+  function invalid(error: unknown): PluginCliError {
+    return new PluginCliError(
+      error instanceof Error ? error.message : String(error),
+      { code: "invalid_value" },
+    );
   }
 
   function reply(json: boolean, value: unknown, text: string) {
@@ -259,14 +366,8 @@ export default async function plugin(bb: BbPluginApi) {
               description: 'What is needed from them, e.g. "pick 1, 2 or 3"',
               aliases: ["needed", "ask"],
             },
-            link: {
-              type: "string",
-              repeatable: true,
-              description:
-                "A link to open: https://…, an absolute path, ~/… or thr_… ; add a label with `target|Label`",
-              aliases: ["url", "links"],
-              placeholder: "target|label",
-            },
+            link: linkOption,
+            choice: choiceOption,
             project: {
               type: "string",
               description:
@@ -299,18 +400,64 @@ export default async function plugin(bb: BbPluginApi) {
                 title: input.positionals.title,
                 needed: input.options.need ?? null,
                 linkTargets: input.options.link,
+                choices: input.options.choice,
                 project: input.options.project ?? null,
                 requirement: input.options.req ?? null,
                 threadId,
                 projectId,
               });
             } catch (error) {
-              throw new PluginCliError(
-                error instanceof Error ? error.message : String(error),
-                { code: "invalid_value" },
-              );
+              throw invalid(error);
             }
             return reply(input.options.json, item, `Added ${formatItemLine(item)}`);
+          },
+        }),
+        edit: cliCommand({
+          summary: "Change an item's title, what is needed, its choices or links",
+          positionals: [
+            { name: "id", description: "Item number, e.g. 12 or #12", required: true },
+          ],
+          options: {
+            title: { type: "string", description: "New title" },
+            need: {
+              type: "string",
+              description: "New wording of what is needed",
+              aliases: ["needed", "ask"],
+            },
+            choice: { ...choiceOption, description: `${choiceOption.description}; replaces the current ones, \`--choice none\` clears them` },
+            link: { ...linkOption, description: `${linkOption.description}; replaces the current ones` },
+            json: jsonOption,
+          },
+          async run(input) {
+            const id = requireId(input.positionals.id);
+            const existing = store.get(id);
+            if (existing === null) throw notFound(id);
+            const patch: ItemPatch = {};
+            if (input.options.title !== undefined) {
+              const title = input.options.title.trim().slice(0, MAX_TITLE);
+              if (title === "") throw invalid(new Error("title is required"));
+              patch.title = title;
+            }
+            if (input.options.need !== undefined) {
+              patch.needed = emptyToNull(input.options.need.slice(0, MAX_NEEDED));
+            }
+            if (input.options.choice.length > 0) {
+              patch.choices =
+                input.options.choice.length === 1 && input.options.choice[0] === "none"
+                  ? []
+                  : normalizeChoices(input.options.choice);
+            }
+            if (input.options.link.length > 0) {
+              try {
+                patch.links = await parseLinks(input.options.link, existing.threadId);
+              } catch (error) {
+                throw invalid(error);
+              }
+            }
+            const item = store.update(id, patch);
+            if (item === null) throw notFound(id);
+            changed();
+            return reply(input.options.json, item, formatItemLine(item));
           },
         }),
         done: cliCommand({
@@ -363,7 +510,11 @@ export default async function plugin(bb: BbPluginApi) {
             const threadId = input.options.everywhere
               ? null
               : (input.options.thread ?? ctx.threadId ?? null);
-            const items = store.list({ threadId, includeDone: input.options.all });
+            const items = store.list({
+              threadId,
+              includeDone: input.options.all,
+              includeLater: true,
+            });
             const threads = await threadsFor(items);
             const lines = items.map((item) => {
               const line = formatItemLine(item);
@@ -408,9 +559,9 @@ export default async function plugin(bb: BbPluginApi) {
   bb.agents.registerTool({
     name: "waiting_add",
     description:
-      "Add an item to the user's \"Waiting on you\" checklist: something ready for them to open, pick, answer or do. Always include the link(s) they need to open. The current thread is attached automatically.",
+      "Add an item to the user's \"Waiting on you\" checklist: something ready for them to open, pick, answer or do. Always include the link(s) they need to open. When the question has fixed answers, pass choices so they can answer from the card. The current thread is attached automatically.",
     instructions:
-      "When you hand the user something to look at or decide (a review page, a preview, a question with options, a doc to read), add it with waiting_add and its link. When their reply answers or resolves an item, call waiting_done with its id.",
+      'When you hand the user something to look at or decide (a review page, a preview, a question with options, a doc to read), add it with waiting_add and its link. Give choices (e.g. ["Yes", "No"] or ["1", "2", "3"]) whenever the question has fixed answers: they can tap one on the card and it arrives here as their message. When their reply answers or resolves an item, call waiting_done with its id.',
     presentation: {
       label: {
         pending: "Adding to Waiting on you",
@@ -424,6 +575,11 @@ export default async function plugin(bb: BbPluginApi) {
         .max(MAX_NEEDED)
         .optional()
         .describe('What is needed from them, e.g. "pick 1, 2 or 3" or "yes or no"'),
+      choices: choicesSchema
+        .optional()
+        .describe(
+          'Short answers they can tap, e.g. ["Yes", "No"] or ["A", "B", "C"]; leave out when the answer is free-form',
+        ),
       links: z.array(linkInputSchema).max(MAX_LINKS).optional(),
       project: z
         .string()
@@ -436,13 +592,14 @@ export default async function plugin(bb: BbPluginApi) {
         .optional()
         .describe("Requirement number when there is one, e.g. R-173"),
     }),
-    async execute({ title, needed, links, project, requirement }, ctx) {
+    async execute({ title, needed, choices, links, project, requirement }, ctx) {
       const item = await addItem({
         title,
         needed: needed ?? null,
         linkTargets: (links ?? []).map((link) =>
           link.label === undefined ? link.target : `${link.target}|${link.label}`,
         ),
+        choices: choices ?? [],
         project: project ?? null,
         requirement: requirement ?? null,
         threadId: ctx.threadId,
@@ -455,7 +612,7 @@ export default async function plugin(bb: BbPluginApi) {
   bb.agents.registerTool({
     name: "waiting_done",
     description:
-      "Tick an item off the user's \"Waiting on you\" checklist once they have answered, picked or done it.",
+      "Tick an item off the user's \"Waiting on you\" checklist once they have answered, picked or done it, or once you finished what they told you to do now.",
     presentation: {
       label: {
         pending: "Ticking off Waiting on you",
@@ -492,6 +649,7 @@ export default async function plugin(bb: BbPluginApi) {
       const items = store.list({
         threadId: scope === "thread" ? ctx.threadId : null,
         includeDone,
+        includeLater: true,
       });
       if (items.length === 0) return "Nothing waiting on the user.";
       const threads = scope === "all" ? await threadsFor(items) : {};
@@ -507,22 +665,44 @@ export default async function plugin(bb: BbPluginApi) {
   });
 
   // Standing context: the open items of this thread, so the agent can tick
-  // one off when the user's message answers it.
+  // one off when the user's message answers it, and the ones the user handed
+  // back with "Do now".
   bb.agents.contributeInstructions(({ threadId }) => {
-    const items = store.list({ threadId, includeDone: false });
+    const items = store.list({ threadId, includeDone: true, includeLater: true }).filter(
+      (item) => item.status !== "done",
+    );
     if (items.length === 0) return null;
-    const lines = items
-      .slice(0, 20)
-      .map((item) => {
-        const needed = item.needed === null ? "" : ` (${escapeLine(item.needed)})`;
-        return `- #${item.id} ${escapeLine(item.title)}${needed}`;
-      })
-      .join("\n");
-    return [
-      "Waiting on the user in this thread (the Waiting on you plugin):",
-      lines,
-      "When their message answers or resolves one, call waiting_done with its number. When you hand them something new to open or decide, call waiting_add with its link.",
-    ].join("\n");
+    const now = Date.now();
+    const waiting = items.filter((item) => item.status === "open").slice(0, 20);
+    const doing = items.filter((item) => item.status === "doing").slice(0, 20);
+    const sections: string[] = [];
+    if (waiting.length > 0) {
+      sections.push(
+        "Waiting on the user in this thread (the Waiting on you plugin):",
+        waiting
+          .map((item) => {
+            const needed = item.needed === null ? "" : ` (${escapeLine(item.needed)})`;
+            const choices =
+              item.choices.length > 0 ? ` [${item.choices.join(" / ")}]` : "";
+            const later =
+              item.laterUntil !== null && item.laterUntil > now
+                ? ` — put off until ${new Date(item.laterUntil).toLocaleDateString("en-GB", { day: "numeric", month: "short" })}`
+                : "";
+            return `- #${item.id} ${escapeLine(item.title)}${needed}${choices}${later}`;
+          })
+          .join("\n"),
+      );
+    }
+    if (doing.length > 0) {
+      sections.push(
+        'The user pressed "Do now" on these; do them, then call waiting_done with the number:',
+        doing.map((item) => `- #${item.id} ${escapeLine(item.title)}`).join("\n"),
+      );
+    }
+    sections.push(
+      'A message like `Re #12 "…": Yes` is their answer from the card; that item is already ticked off. When their message answers or resolves one of the above, call waiting_done with its number. When you hand them something new to open or decide, call waiting_add with its link, and give choices when the answers are fixed.',
+    );
+    return sections.join("\n");
   });
 
   bb.onDispose(() => {

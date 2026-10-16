@@ -46,6 +46,12 @@ the answers are fixed.* The thread's open items, and the ones the user said
 Links accept `https://…`, absolute paths, `~/…` (on the thread's machine) and
 `thr_…` thread ids; `target|Label` sets the label.
 
+## Improvements
+
+[IMPROVEMENTS.md](IMPROVEMENTS.md) is the one list of what to change next.
+Add new asks there rather than messaging the thread working on the plugin;
+read it before starting work, and move items to Done with their version.
+
 ## Development
 
 ```sh

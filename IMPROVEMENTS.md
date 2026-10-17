@@ -12,6 +12,14 @@ where Pritam's own words are kept).
 
 ## Open
 
+- [ ] **Answers are kept, not sent.** Tapping a choice sends `Re #n "…": Yes`
+  to the item's thread at once, which interrupts its agent mid-turn (on 17
+  Oct nine answers landed one by one inside other work). Store the answer
+  instead: in a file the thread's agent can read, and in `waiting_list` /
+  `bb waiting`, so the agent picks answers up at its next turn or when asked.
+  Pritam: "it should store in a file which access will have the agent so
+  instead of sending each answer one by one agent can just read there when
+  required or requested". 2026-10-17, R-105.
 - [ ] **Links must open on the web.** Pritam reads bb remotely, so a link to
   a file on the host (`/home/…`, `~/…`) doesn't open for him, and agents
   keep adding them. `waiting_add`, `bb waiting add` and `bb waiting edit`

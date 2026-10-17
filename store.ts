@@ -51,6 +51,12 @@ export const itemSchema = z.object({
   status: itemStatusSchema,
   /** The answer the user gave from the card, when they did. */
   answer: z.string().nullable(),
+  /** When they tapped it. Answers are kept for the agent, not sent. */
+  answeredAt: z.number().nullable(),
+  /** When the thread's agent picked the answer up (or it was sent); null while it waits. */
+  pickedUpAt: z.number().nullable(),
+  /** When the user sent it to the thread with "Send answers". */
+  sentAt: z.number().nullable(),
   /** Hidden from the card until this time ("Later"). */
   laterUntil: z.number().nullable(),
   /** Set by "Next": newest wins the top of the list. */
@@ -83,6 +89,12 @@ export const MIGRATIONS: readonly string[] = [
   `ALTER TABLE items ADD COLUMN answer TEXT`,
   `ALTER TABLE items ADD COLUMN later_until INTEGER`,
   `ALTER TABLE items ADD COLUMN next_at INTEGER`,
+  // 0.3.0 — answers are kept for the agent instead of sent one by one.
+  `ALTER TABLE items ADD COLUMN answered_at INTEGER`,
+  `ALTER TABLE items ADD COLUMN picked_up_at INTEGER`,
+  `ALTER TABLE items ADD COLUMN sent_at INTEGER`,
+  // Answers given before 0.3.0 were sent to their thread at once.
+  `UPDATE items SET answered_at = done_at, sent_at = done_at, picked_up_at = done_at WHERE answer IS NOT NULL`,
 ];
 
 interface ItemRow {
@@ -97,6 +109,9 @@ interface ItemRow {
   requirement: string | null;
   status: string;
   answer: string | null;
+  answered_at: number | null;
+  picked_up_at: number | null;
+  sent_at: number | null;
   later_until: number | null;
   next_at: number | null;
   created_at: number;
@@ -128,6 +143,9 @@ function rowToItem(row: ItemRow): Item {
     requirement: row.requirement,
     status: status.success ? status.data : "open",
     answer: row.answer,
+    answeredAt: row.answered_at,
+    pickedUpAt: row.picked_up_at,
+    sentAt: row.sent_at,
     laterUntil: row.later_until,
     nextAt: row.next_at,
     createdAt: row.created_at,
@@ -158,10 +176,20 @@ export interface ItemPatch {
 export interface ListFilter {
   threadId?: string | null;
   includeDone?: boolean;
+  /** Include answered items whose answer the agent has not picked up yet. */
+  includeAnswered?: boolean;
   /** Include items the user put off for later; the card leaves them out. */
   includeLater?: boolean;
   now?: number;
 }
+
+/** Answered on the card, and the thread's agent has not picked it up yet. */
+export function isPendingAnswer(item: Item): boolean {
+  return item.status === "done" && item.answer !== null && item.pickedUpAt === null;
+}
+
+const PENDING_ANSWER_SQL =
+  "(status = 'done' AND answer IS NOT NULL AND picked_up_at IS NULL)";
 
 export class WaitingStore {
   constructor(private readonly db: Database.Database) {}
@@ -197,8 +225,9 @@ export class WaitingStore {
   }
 
   /**
-   * Open items first, then doing, then done; within that, "Next" items on
-   * top (newest press first), the rest oldest first.
+   * Open items (and answers waiting for the agent, which keep their place)
+   * first, then doing, then done; within that, "Next" items on top (newest
+   * press first), the rest oldest first.
    */
   list(filter: ListFilter = {}): Item[] {
     const now = filter.now ?? Date.now();
@@ -209,7 +238,9 @@ export class WaitingStore {
       params.push(filter.threadId);
     }
     if (!filter.includeDone) {
-      clauses.push("status = 'open'");
+      clauses.push(
+        filter.includeAnswered ? `(status = 'open' OR ${PENDING_ANSWER_SQL})` : "status = 'open'",
+      );
     }
     if (!filter.includeLater) {
       clauses.push("(later_until IS NULL OR later_until <= ?)");
@@ -219,7 +250,8 @@ export class WaitingStore {
     const rows = this.db
       .prepare(
         `SELECT * FROM items ${where}
-         ORDER BY CASE status WHEN 'open' THEN 0 WHEN 'doing' THEN 1 ELSE 2 END,
+         ORDER BY CASE WHEN status = 'open' OR ${PENDING_ANSWER_SQL} THEN 0
+                       WHEN status = 'doing' THEN 1 ELSE 2 END,
                   (next_at IS NULL) ASC, next_at DESC, created_at ASC, id ASC`,
       )
       .all(...params) as ItemRow[];
@@ -256,29 +288,94 @@ export class WaitingStore {
     return this.get(id);
   }
 
-  setDone(
-    id: number,
-    done: boolean,
-    by: DoneBy,
-    at = Date.now(),
-    answer: string | null = null,
-  ): Item | null {
+  /** Tick off (the check mark, or the agent) or put back on the list. */
+  setDone(id: number, done: boolean, by: DoneBy, at = Date.now()): Item | null {
     const existing = this.get(id);
     if (existing === null) return null;
-    if (done) {
+    if (done && existing.status === "done" && existing.answer !== null) {
+      // Already answered: ticking it again (the agent's waiting_done) means
+      // the answer was picked up; the answer itself stays on record.
+      this.db
+        .prepare(`UPDATE items SET picked_up_at = COALESCE(picked_up_at, ?) WHERE id = ?`)
+        .run(at, id);
+    } else if (done) {
       this.db
         .prepare(
-          `UPDATE items SET status = 'done', done_at = ?, done_by = ?, answer = ?, later_until = NULL WHERE id = ?`,
+          `UPDATE items SET status = 'done', done_at = ?, done_by = ?, answer = NULL,
+             answered_at = NULL, picked_up_at = NULL, sent_at = NULL, later_until = NULL
+           WHERE id = ?`,
         )
-        .run(at, by, answer, id);
+        .run(at, by, id);
     } else {
       this.db
         .prepare(
-          `UPDATE items SET status = 'open', done_at = NULL, done_by = NULL, answer = NULL WHERE id = ?`,
+          `UPDATE items SET status = 'open', done_at = NULL, done_by = NULL, answer = NULL,
+             answered_at = NULL, picked_up_at = NULL, sent_at = NULL
+           WHERE id = ?`,
         )
         .run(id);
     }
     return this.get(id);
+  }
+
+  /**
+   * The user tapped a choice: keep the answer for the thread's agent and tick
+   * the item as answered. Nothing is sent.
+   */
+  answer(id: number, answer: string, at = Date.now()): Item | null {
+    const existing = this.get(id);
+    if (existing === null) return null;
+    this.db
+      .prepare(
+        `UPDATE items SET status = 'done', done_at = ?, done_by = 'user', answer = ?,
+           answered_at = ?, picked_up_at = NULL, sent_at = NULL, later_until = NULL
+         WHERE id = ?`,
+      )
+      .run(at, answer, at, id);
+    return this.get(id);
+  }
+
+  /** Answers the agent has not picked up yet, oldest first. */
+  pendingAnswers(threadId: string | null): Item[] {
+    const rows = this.db
+      .prepare(
+        `SELECT * FROM items WHERE ${PENDING_ANSWER_SQL}
+         ${threadId === null ? "" : "AND thread_id = ?"}
+         ORDER BY answered_at ASC, id ASC`,
+      )
+      .all(...(threadId === null ? [] : [threadId])) as ItemRow[];
+    return rows.map(rowToItem);
+  }
+
+  /** The agent read these answers; they leave its list and the card. */
+  pickUp(ids: readonly number[], at = Date.now()): number {
+    let changes = 0;
+    const statement = this.db.prepare(
+      `UPDATE items SET picked_up_at = ? WHERE id = ? AND ${PENDING_ANSWER_SQL}`,
+    );
+    for (const id of ids) changes += statement.run(at, id).changes;
+    return changes;
+  }
+
+  /** "Send answers": they went to the thread in one message. */
+  markSent(ids: readonly number[], at = Date.now()): number {
+    let changes = 0;
+    const statement = this.db.prepare(
+      `UPDATE items SET sent_at = ?, picked_up_at = ? WHERE id = ? AND ${PENDING_ANSWER_SQL}`,
+    );
+    for (const id of ids) changes += statement.run(at, at, id).changes;
+    return changes;
+  }
+
+  /** Threads with something open, being done, or an answer waiting. */
+  activeThreadIds(): string[] {
+    const rows = this.db
+      .prepare(
+        `SELECT DISTINCT thread_id FROM items
+         WHERE thread_id IS NOT NULL AND (status IN ('open', 'doing') OR ${PENDING_ANSWER_SQL})`,
+      )
+      .all() as { thread_id: string }[];
+    return rows.map((row) => row.thread_id);
   }
 
   /** "Do now": the agent has it; it stops waiting on the user. */
@@ -346,32 +443,40 @@ export function normalizeChoices(raw: readonly string[]): string[] {
   return choices;
 }
 
-export interface LinkTargetContext {
-  /** Host a bare path belongs to. */
-  hostId: string | null;
-  /** Expands a leading `~` when the path lives on the server's own machine. */
-  homeDir: string | null;
+const THREAD_ID_PATTERN = /^(?:@thread:)?(thr_[a-z0-9]+)(?:#.*)?$/iu;
+
+/** Split `target|label` into its parts. */
+function splitTarget(raw: string): { target: string; label: string | null } {
+  const trimmed = raw.trim();
+  const separator = trimmed.indexOf("|");
+  const target = separator === -1 ? trimmed : trimmed.slice(0, separator).trim();
+  const labelPart = separator === -1 ? "" : trimmed.slice(separator + 1).trim();
+  return { target, label: labelPart === "" ? null : labelPart };
 }
 
-const THREAD_ID_PATTERN = /^(?:@thread:)?(thr_[a-z0-9]+)(?:#.*)?$/iu;
+/**
+ * A file on a machine (`/home/…`, `~/…`, `file:…`): the user reads bb on the
+ * web, often from another device, so these don't open for them.
+ */
+export function isLocalPathTarget(raw: string): boolean {
+  const { target } = splitTarget(raw);
+  return (
+    target.startsWith("/") ||
+    target.startsWith("~/") ||
+    target === "~" ||
+    /^file:/iu.test(target)
+  );
+}
 
 /**
  * Turn one free-form link target into a typed link. `target|label` sets the
- * label; URLs, absolute paths, `~/…` paths and `thr_…` ids are recognised.
- * Returns null when the target cannot be a link.
+ * label; `https://…` URLs and `thr_…` thread ids are links. Local paths are
+ * not (see isLocalPathTarget); null for anything that cannot be a link.
  */
-export function parseLinkTarget(
-  raw: string,
-  context: LinkTargetContext,
-): ItemLink | null {
-  const trimmed = raw.trim();
-  if (trimmed === "") return null;
-  const separator = trimmed.indexOf("|");
-  const target =
-    separator === -1 ? trimmed : trimmed.slice(0, separator).trim();
-  const labelPart = separator === -1 ? "" : trimmed.slice(separator + 1).trim();
-  const label = labelPart === "" ? null : labelPart;
-  if (/^https?:\/\//iu.test(target)) {
+export function parseLinkTarget(raw: string): ItemLink | null {
+  const { target, label } = splitTarget(raw);
+  if (target === "") return null;
+  if (/^https?:\/\/\S+$/iu.test(target)) {
     return { kind: "url", url: target, label };
   }
   const threadMatch = THREAD_ID_PATTERN.exec(target);
@@ -380,16 +485,44 @@ export function parseLinkTarget(
     if (threadId === undefined) return null;
     return { kind: "thread", threadId, label };
   }
-  if (target.startsWith("/") || target.startsWith("~/") || target === "~") {
-    if (context.hostId === null) return null;
-    let path = target;
-    if (path.startsWith("~")) {
-      if (context.homeDir === null) return null;
-      path = context.homeDir + path.slice(1);
-    }
-    return { kind: "file", hostId: context.hostId, path, label };
-  }
   return null;
+}
+
+export const LINK_HELP =
+  "use an https:// link (publish a file with omni-media, or link it on GitHub or the dev site) or a thr_… thread id";
+
+/** Typed links, or the reason some targets were refused. */
+export function parseLinkTargets(
+  targets: readonly string[],
+): { links: ItemLink[] } | { error: string } {
+  const links: ItemLink[] = [];
+  const local: string[] = [];
+  const bad: string[] = [];
+  for (const raw of targets) {
+    if (isLocalPathTarget(raw)) {
+      local.push(splitTarget(raw).target);
+      continue;
+    }
+    const link = parseLinkTarget(raw);
+    if (link === null) bad.push(raw.trim());
+    else links.push(link);
+  }
+  const problems: string[] = [];
+  if (local.length > 0) {
+    problems.push(
+      `a local path doesn't open for the user on the web: ${local.join(", ")}`,
+    );
+  }
+  if (bad.length > 0) problems.push(`not a link: ${bad.join(", ")}`);
+  if (problems.length > 0) {
+    return { error: `${problems.join("; ")} (${LINK_HELP})` };
+  }
+  return { links };
+}
+
+/** Links added before 0.3.0 may be host paths; the card flags them. */
+export function hasPathLink(item: Item): boolean {
+  return item.links.some((link) => link.kind === "file");
 }
 
 /** Short human label for a link when none was given. */
@@ -428,9 +561,15 @@ export function linkText(link: ItemLink): string {
   }
 }
 
-/** The user message sent to the item's thread when they answer from the card. */
-export function answerMessage(item: Item, answer: string): string {
-  return `Re #${item.id} "${item.title}": ${answer}`;
+/**
+ * "Send answers": every pending answer of a thread in one user message, e.g.
+ * `Answers: #12 "Keep the handle?": Yes; #14 "Pick a grid": 2`.
+ */
+export function answersMessage(items: readonly Item[]): string {
+  const parts = items
+    .filter((item) => item.answer !== null)
+    .map((item) => `#${item.id} "${oneLine(item.title)}": ${oneLine(item.answer ?? "")}`);
+  return `Answers: ${parts.join("; ")}`;
 }
 
 /** The user message sent when they press "Do now". */
@@ -444,6 +583,18 @@ function shortDate(at: number): string {
     month: "short",
   });
 }
+
+/** `2026-10-17 14:02 UTC`: one reading for every agent and machine. */
+export function utcStamp(at: number): string {
+  return `${new Date(at).toISOString().slice(0, 16).replace("T", " ")} UTC`;
+}
+
+/** Keep stored text on one line. */
+export function oneLine(value: string): string {
+  return value.replace(/\s+/gu, " ").trim();
+}
+
+const PATH_FLAG = "(a file on the host: doesn't open on the web; replace it with an https link)";
 
 /** One readable line per item for CLI and tool output. */
 export function formatItemLine(item: Item, now = Date.now()): string {
@@ -460,9 +611,90 @@ export function formatItemLine(item: Item, now = Date.now()): string {
     item.needed === null || item.needed === "" ? "" : ` — ${item.needed}`;
   const choices = item.choices.length > 0 ? ` [${item.choices.join(" / ")}]` : "";
   const metaText = meta.length > 0 ? ` (${meta.join(" · ")})` : "";
-  const answer =
-    item.answer === null ? "" : ` → ${item.answer}`;
+  let answer = "";
+  if (item.answer !== null) {
+    answer = ` → ${item.answer}`;
+    if (isPendingAnswer(item) && item.answeredAt !== null) {
+      answer += ` (answered ${utcStamp(item.answeredAt)}, not picked up yet)`;
+    } else if (item.sentAt !== null) {
+      answer += " (sent)";
+    }
+  }
   const doing = item.status === "doing" ? " → do now" : "";
-  const links = item.links.map((link) => `\n      ${linkText(link)}`).join("");
+  const links = item.links
+    .map((link) => `\n      ${linkText(link)}${link.kind === "file" ? ` ${PATH_FLAG}` : ""}`)
+    .join("");
   return `${head}${needed}${choices}${metaText}${answer}${doing}${links}`;
+}
+
+/** Where the answers file sits inside a thread's storage folder. */
+export const ANSWERS_FILE_NAME = "waiting-on-you.md";
+
+/**
+ * The per-thread file the thread's agent reads: answers not picked up yet,
+ * then what still waits on the user, then what they said "Do now" to.
+ * Rewritten whole on every change.
+ */
+export function answersFileText(input: {
+  threadId: string;
+  items: readonly Item[];
+  now?: number;
+}): string {
+  const now = input.now ?? Date.now();
+  const pending = input.items.filter(isPendingAnswer);
+  const open = input.items.filter((item) => item.status === "open");
+  const doing = input.items.filter((item) => item.status === "doing");
+  const linkLines = (item: Item) =>
+    item.links.map(
+      (link) => `  - ${linkText(link)}${link.kind === "file" ? ` ${PATH_FLAG}` : ""}`,
+    );
+  const lines: string[] = [
+    "# Waiting on you",
+    "",
+    `Kept by the Waiting on you plugin for thread ${input.threadId}; rewritten on every change. Updated ${utcStamp(now)}.`,
+    "",
+    "## Answers not picked up yet",
+    "",
+  ];
+  if (pending.length === 0) {
+    lines.push("None.");
+  } else {
+    for (const item of pending) {
+      const at = item.answeredAt === null ? "" : `, ${utcStamp(item.answeredAt)}`;
+      lines.push(
+        `- #${item.id} "${oneLine(item.title)}": ${oneLine(item.answer ?? "")} (answered by the user${at})`,
+      );
+    }
+    lines.push(
+      "",
+      "Act on these, then run `bb waiting answers --ack` (or call waiting_list with ack: true) so they leave this list.",
+    );
+  }
+  lines.push("", "## Waiting on the user", "");
+  if (open.length === 0) {
+    lines.push("Nothing.");
+  } else {
+    for (const item of open) {
+      const needed = item.needed === null ? "" : `: ${oneLine(item.needed)}`;
+      const choices = item.choices.length > 0 ? ` [${item.choices.join(" / ")}]` : "";
+      const meta = [item.project, item.requirement].filter(
+        (part): part is string => part !== null && part !== "",
+      );
+      const metaText = meta.length > 0 ? ` (${meta.join(" · ")})` : "";
+      const later =
+        item.laterUntil !== null && item.laterUntil > now
+          ? ` (put off until ${utcStamp(item.laterUntil)})`
+          : "";
+      lines.push(`- #${item.id} ${oneLine(item.title)}${needed}${choices}${metaText}${later}`);
+      lines.push(...linkLines(item));
+    }
+  }
+  if (doing.length > 0) {
+    lines.push("", '## "Do now" (do these, then call waiting_done with the number)', "");
+    for (const item of doing) {
+      lines.push(`- #${item.id} ${oneLine(item.title)}`);
+      lines.push(...linkLines(item));
+    }
+  }
+  return `${lines.join("\n")}\n`;
 }

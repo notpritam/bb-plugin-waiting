@@ -6,9 +6,11 @@
 // 2. A "Waiting on you" section on the home screen with every open item
 //    across threads and projects.
 //
-// Each row: tick it done; tap a choice to answer (the answer goes to the
-// item's thread as the user's message); or, from the row's menu, "Do now",
-// "Next", "Later" (tomorrow, next week, a date) and "Reply…" in the card.
+// Each row: tick it done; tap a choice to answer (the answer is kept for the
+// thread's agent and shows quietly in place; nothing is sent); or, from the
+// row's menu, "Do now", "Next", "Later" (tomorrow, next week, a date) and
+// "Reply…" in the card. The card's "Send answers" sends every kept answer of
+// the thread in one message, when the user wants the agent woken.
 import {
   useCallback,
   useEffect,
@@ -60,6 +62,9 @@ const CARD_HEADER_BUTTON_CLASS =
   "flex min-h-8 w-full min-w-0 cursor-pointer items-center gap-1.5 rounded-none px-3 py-1.5 text-xs text-foreground transition-colors hover:bg-background/80";
 const LINK_PILL_CLASS =
   "inline-flex h-4 max-w-56 min-w-0 shrink-0 items-center gap-0.5 rounded-full bg-surface-recessed px-1.5 text-2xs leading-none text-subtle-foreground transition-colors hover:text-foreground";
+/** The card header's one action, "Send answers": small, outlined. */
+const HEADER_ACTION_CLASS =
+  "mr-2 inline-flex h-5 shrink-0 items-center gap-1 rounded-md border border-border bg-background px-1.5 text-2xs font-medium leading-none text-foreground transition-colors hover:bg-state-hover disabled:pointer-events-none disabled:opacity-50";
 /** A choice reads as a button: outlined, foreground text. */
 const CHOICE_PILL_CLASS =
   "inline-flex h-4 shrink-0 items-center rounded-full border border-border bg-background px-1.5 text-2xs font-medium leading-none text-foreground transition-colors hover:bg-state-hover disabled:pointer-events-none disabled:opacity-50";
@@ -82,20 +87,22 @@ interface WaitingData {
 function useWaitingItems(threadId: string | null) {
   const rpc = useRpc<typeof rpcContract>();
   const [data, setData] = useState<WaitingData | null>(null);
-  const refetch = useCallback(() => {
-    rpc.call("list", { threadId }).then(setData, () => {
-      /* keep the last good list; the next signal retries */
-    });
-  }, [rpc, threadId]);
+  const refetch = useCallback(
+    (): Promise<void> =>
+      rpc.call("list", { threadId }).then(setData, () => {
+        /* keep the last good list; the next signal retries */
+      }),
+    [rpc, threadId],
+  );
   useEffect(() => {
-    refetch();
+    void refetch();
   }, [refetch]);
-  useRealtime(CHANGED, refetch);
+  useRealtime(CHANGED, () => void refetch());
   const connection = useRealtimeConnectionState();
   const seenConnected = useRef(false);
   useEffect(() => {
     if (connection !== "connected") return;
-    if (seenConnected.current) refetch();
+    if (seenConnected.current) void refetch();
     seenConnected.current = true;
   }, [connection, refetch]);
   // Items put off for later come back on their own.
@@ -103,15 +110,16 @@ function useWaitingItems(threadId: string | null) {
   useEffect(() => {
     if (returnsAt === null) return;
     const delay = Math.min(Math.max(returnsAt - Date.now(), 0) + 500, MAX_RETURN_TIMER_MS);
-    const timer = setTimeout(refetch, delay);
+    const timer = setTimeout(() => void refetch(), delay);
     return () => clearTimeout(timer);
   }, [returnsAt, refetch]);
+  /** Resolves once the list on screen shows the change. */
   const settle = useCallback(
     (call: Promise<unknown>) =>
       call.then(
         () => refetch(),
         (error: unknown) => {
-          refetch();
+          void refetch();
           throw error;
         },
       ),
@@ -125,7 +133,16 @@ function useWaitingItems(threadId: string | null) {
     (id: number, action: ItemAction) => settle(rpc.call("act", { id, action })),
     [rpc, settle],
   );
-  return { data, setDone, act };
+  const sendAnswers = useCallback(
+    (forThread: string) => settle(rpc.call("sendAnswers", { threadId: forThread })),
+    [rpc, settle],
+  );
+  return { data, setDone, act, sendAnswers };
+}
+
+/** Answered on the card; the thread's agent hasn't picked it up yet. */
+function isPendingAnswer(item: Item): boolean {
+  return item.status === "done" && item.answer !== null && item.pickedUpAt === null;
 }
 
 /** Items tick visibly, then fold away once the server confirms. */
@@ -175,7 +192,10 @@ type RowAction = ItemAction | { kind: "done"; done: boolean } | { kind: "reply" 
 
 const FAILED = "Didn't go through. Try again, or reply in the thread.";
 
-/** Routes a row's actions: ticks and answers fold away, later/next just refetch. */
+/**
+ * Routes a row's actions: ticks and "Do now" fold away; an answer stays in
+ * place (shown at once, before the server confirms); later/next refetch.
+ */
 function useRowActions(
   setDone: (id: number, done: boolean) => Promise<void>,
   act: (id: number, action: ItemAction) => Promise<void>,
@@ -183,6 +203,7 @@ function useRowActions(
 ) {
   const { ticked, fold, unfold } = useFoldAway();
   const [errors, setErrors] = useState<ReadonlyMap<number, string>>(new Map());
+  const [answering, setAnswering] = useState<ReadonlyMap<number, string>>(new Map());
   const run = useCallback((id: number, task: () => Promise<void>) => {
     setErrors((previous) => {
       if (!previous.has(id)) return previous;
@@ -202,6 +223,15 @@ function useRowActions(
           else if (!unfold(item.id)) void run(item.id, () => setDone(item.id, false));
           return;
         case "answer":
+          setAnswering((previous) => new Map(previous).set(item.id, action.answer));
+          void run(item.id, () => act(item.id, action)).finally(() =>
+            setAnswering((previous) => {
+              const next = new Map(previous);
+              next.delete(item.id);
+              return next;
+            }),
+          );
+          return;
         case "doNow":
           fold(item.id, () => run(item.id, () => act(item.id, action)));
           return;
@@ -216,7 +246,7 @@ function useRowActions(
     },
     [act, fold, reply, run, setDone, unfold],
   );
-  return { ticked, errors, onAct };
+  return { ticked, errors, answering, onAct };
 }
 
 // ---- small pieces ------------------------------------------------------
@@ -335,12 +365,14 @@ function LinkPill({ link }: { link: ItemLink }) {
         </UrlLink>
       );
     case "file":
+      // Added before links had to open on the web: flag it, quietly.
       return (
         <FileLink
           target={{ kind: "host", hostId: link.hostId, path: link.path }}
-          className={LINK_PILL_CLASS}
-          title={link.path}
+          className={cn(LINK_PILL_CLASS, "text-destructive-text")}
+          title={`${link.path}: a file on the host, which doesn't open on the web. Ask the agent for an https link.`}
         >
+          <Icon name="TriangleAlert" fallback="Info" className="size-2.5 shrink-0" aria-hidden="true" />
           {inner}
         </FileLink>
       );
@@ -470,6 +502,7 @@ function ItemRow({
   item,
   ticked,
   error,
+  answering,
   onAct,
   canReply,
   thread,
@@ -477,11 +510,16 @@ function ItemRow({
   item: Item;
   ticked: boolean;
   error: string | undefined;
+  /** The choice just tapped, shown before the server confirms it. */
+  answering: string | undefined;
   onAct: (action: RowAction) => void;
   canReply: boolean;
   /** Shown only on the overview, where items come from many threads. */
   thread?: { id: string; title: string | null };
 }) {
+  // Answered: kept for the agent. The row stays, quiet, with the answer.
+  const answer = answering ?? (isPendingAnswer(item) ? item.answer : null);
+  const answered = answer !== null;
   const state = ticked ? "completed" : "pending";
   const meta: string[] = [];
   if (item.project !== null) meta.push(item.project);
@@ -497,17 +535,37 @@ function ItemRow({
     >
       <Checkbox
         id={checkboxId}
-        checked={ticked}
+        checked={ticked || answered}
+        disabled={answering !== undefined}
         onCheckedChange={(checked) => onAct({ kind: "done", done: checked === true })}
-        aria-label={`Mark "${item.title}" ${ticked ? "not done" : "done"}`}
+        aria-label={
+          answered
+            ? `Take back the answer to "${item.title}"`
+            : `Mark "${item.title}" ${ticked ? "not done" : "done"}`
+        }
         className="mt-0.5"
       />
       <div className="flex min-w-0 flex-1 flex-col gap-0.5">
-        <label htmlFor={checkboxId} className="cursor-pointer leading-5">
-          <span className={activityTextClass(state, "text-foreground")}>
+        {/* An answered row's title doesn't toggle: only its check mark takes the answer back. */}
+        <label
+          htmlFor={answered ? undefined : checkboxId}
+          className={answered ? "leading-5" : "cursor-pointer leading-5"}
+        >
+          <span
+            className={
+              answered
+                ? "text-muted-foreground"
+                : activityTextClass(state, "text-foreground")
+            }
+          >
             {item.title}
           </span>
-          {item.needed === null ? null : (
+          {answered ? (
+            <span className="text-subtle-foreground">
+              {" · "}
+              <span className="font-medium text-muted-foreground">{answer}</span>
+            </span>
+          ) : item.needed === null ? null : (
             <span className="text-muted-foreground"> · {item.needed}</span>
           )}
         </label>
@@ -524,18 +582,20 @@ function ItemRow({
           {item.links.map((link, index) => (
             <LinkPill key={`${item.id}-${index}`} link={link} />
           ))}
-          {item.choices.map((choice) => (
-            <button
-              key={choice}
-              type="button"
-              disabled={ticked}
-              className={CHOICE_PILL_CLASS}
-              title={`Answer "${choice}" in the thread`}
-              onClick={() => onAct({ kind: "answer", answer: choice })}
-            >
-              {choice}
-            </button>
-          ))}
+          {answered
+            ? null
+            : item.choices.map((choice) => (
+                <button
+                  key={choice}
+                  type="button"
+                  disabled={ticked}
+                  className={CHOICE_PILL_CLASS}
+                  title={`Answer "${choice}"; it is kept for the thread's agent`}
+                  onClick={() => onAct({ kind: "answer", answer: choice })}
+                >
+                  {choice}
+                </button>
+              ))}
           {error === undefined ? null : (
             <span role="alert" className="text-2xs text-destructive">
               {error}
@@ -543,7 +603,11 @@ function ItemRow({
           )}
         </div>
       </div>
-      <RowMenu title={item.title} disabled={ticked} canReply={canReply} onAct={onAct} />
+      {answered ? (
+        <span className="size-5 shrink-0" aria-hidden="true" />
+      ) : (
+        <RowMenu title={item.title} disabled={ticked} canReply={canReply} onAct={onAct} />
+      )}
     </li>
   );
 }
@@ -625,7 +689,7 @@ function WaitingCard() {
   const composer = useComposer();
   const threadId = composer.scope.kind === "thread" ? composer.scope.threadId : null;
   const pluginId = usePluginId();
-  const { data, setDone, act } = useWaitingItems(threadId);
+  const { data, setDone, act, sendAnswers } = useWaitingItems(threadId);
   // "Reply…" starts the answer in this thread's composer.
   const reply = useCallback(
     (item: Item) => {
@@ -635,14 +699,31 @@ function WaitingCard() {
     },
     [composer],
   );
-  const { ticked, errors, onAct } = useRowActions(setDone, act, reply);
+  const { ticked, errors, answering, onAct } = useRowActions(setDone, act, reply);
   const [isExpanded, setExpanded] = useStoredExpanded(`${pluginId}:card-expanded`);
   const focus = useDisclosureFocusHandoff(isExpanded, () => setExpanded(!isExpanded));
+  const [sending, setSending] = useState(false);
+  const [sendError, setSendError] = useState<string | null>(null);
   const items = data?.items ?? [];
   if (threadId === null || items.length === 0) return null;
   const bodyId = `waiting-card-body-${threadId}`;
   const toggleId = `waiting-card-toggle-${threadId}`;
-  const summary = `Waiting on you · ${items.length}`;
+  const answeredCount = items.filter(
+    (item) => answering.has(item.id) || isPendingAnswer(item),
+  ).length;
+  const openCount = items.length - answeredCount;
+  const counts = [
+    ...(openCount > 0 ? [String(openCount)] : []),
+    ...(answeredCount > 0 ? [`${answeredCount} answered`] : []),
+  ];
+  const summary = `Waiting on you · ${counts.join(" · ")}`;
+  const onSend = () => {
+    setSending(true);
+    setSendError(null);
+    sendAnswers(threadId)
+      .catch(() => setSendError(FAILED))
+      .finally(() => setSending(false));
+  };
   return (
     <div
       className="overflow-hidden"
@@ -655,7 +736,7 @@ function WaitingCard() {
           id={toggleId}
           aria-expanded={isExpanded}
           aria-controls={bodyId}
-          aria-label={`${summary} ${items.length === 1 ? "item" : "items"}`}
+          aria-label={summary}
           ref={focus.triggerRef}
           onClick={focus.onTriggerClick}
           className={cn(CARD_HEADER_BUTTON_CLASS, PROMPT_STACK_DISCLOSURE_TRIGGER_CLASS)}
@@ -666,7 +747,23 @@ function WaitingCard() {
           </span>
           <PromptStackHoverChevron isExpanded={isExpanded} />
         </button>
+        {answeredCount > 0 ? (
+          <button
+            type="button"
+            disabled={sending || answering.size > 0}
+            className={HEADER_ACTION_CLASS}
+            title="Send every answer to this thread in one message, to wake its agent. Otherwise they wait for it, unsent."
+            onClick={onSend}
+          >
+            {sending ? "Sending…" : "Send answers"}
+          </button>
+        ) : null}
       </div>
+      {sendError === null ? null : (
+        <p role="alert" className="px-3 pb-1.5 text-2xs text-destructive">
+          {sendError}
+        </p>
+      )}
       <DisclosureBody
         id={bodyId}
         labelledBy={toggleId}
@@ -682,6 +779,7 @@ function WaitingCard() {
               item={item}
               ticked={ticked.has(item.id)}
               error={errors.get(item.id)}
+              answering={answering.get(item.id)}
               onAct={(action) => onAct(item, action)}
               canReply
             />
@@ -711,7 +809,7 @@ function groupByProject(items: readonly Item[]): [string, Item[]][] {
 
 function Overview() {
   const { data, setDone, act } = useWaitingItems(null);
-  const { ticked, errors, onAct } = useRowActions(setDone, act);
+  const { ticked, errors, answering, onAct } = useRowActions(setDone, act);
   if (data === null) return null;
   if (data.items.length === 0) {
     return (
@@ -735,6 +833,7 @@ function Overview() {
                 item={item}
                 ticked={ticked.has(item.id)}
                 error={errors.get(item.id)}
+                answering={answering.get(item.id)}
                 onAct={(action) => onAct(item, action)}
                 canReply={false}
                 thread={

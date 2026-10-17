@@ -12,20 +12,7 @@ where Pritam's own words are kept).
 
 ## Open
 
-- [ ] **Answers are kept, not sent.** Tapping a choice sends `Re #n "…": Yes`
-  to the item's thread at once, which interrupts its agent mid-turn (on 17
-  Oct nine answers landed one by one inside other work). Store the answer
-  instead: in a file the thread's agent can read, and in `waiting_list` /
-  `bb waiting`, so the agent picks answers up at its next turn or when asked.
-  Pritam: "it should store in a file which access will have the agent so
-  instead of sending each answer one by one agent can just read there when
-  required or requested". 2026-10-17, R-105.
-- [ ] **Links must open on the web.** Pritam reads bb remotely, so a link to
-  a file on the host (`/home/…`, `~/…`) doesn't open for him, and agents
-  keep adding them. `waiting_add`, `bb waiting add` and `bb waiting edit`
-  should refuse a local path with a clear message (publish it with
-  `omni-media`, or link GitHub or the dev site), and the card should flag any
-  existing item whose link is a path. 2026-10-16, R-104.
+Nothing open.
 
 ## Proposed (ours, waiting on Pritam's yes)
 
@@ -39,6 +26,26 @@ where Pritam's own words are kept).
 
 ## Done
 
+- [x] **Answers are kept, not sent** (v0.3.0, 2026-10-17, R-105): tapping a
+  choice keeps the answer (who, item, choice, time) and ticks the item as
+  answered; nothing is sent. The answer shows quietly in place on the card
+  until the thread's agent picks it up. Each thread has a file its agent
+  reads, `$BB_THREAD_STORAGE/waiting-on-you.md` (or `threads/<id>.md` in the
+  plugin's data folder when thread storage can't be written), rewritten on
+  every change: answers not picked up yet, then what still waits, then
+  "Do now". The agent's instructions gain "Answers since you last looked" and
+  the file's path; `waiting_list` and `bb waiting list` show each answer;
+  `bb waiting answers --ack` or `waiting_list` with `ack: true` marks them
+  picked up. The card's one "Send answers" sends every pending answer of the
+  thread in one message. "Reply…" and "Do now" still send. Answers from
+  before 0.3.0 count as sent.
+- [x] **Links must open on the web** (v0.3.0, 2026-10-17, R-104):
+  `waiting_add`, `bb waiting add` and `bb waiting edit` refuse local paths
+  (`/home/…`, `~/…`, `file:`) with a hint (publish with `omni-media`, link
+  GitHub or the dev site, or a `thr_…` id); `https://` and `thr_` stay. An
+  older item whose link is a path shows the link in red with a warning on
+  the card, and is flagged in the CLI, the tools and the agent's
+  instructions.
 - [x] **More than a check mark** (v0.2.0, 2026-10-16, R-102): choices as
   buttons that answer in the item's thread; a row menu with Do now, Next,
   Later (tomorrow, next week, a date) and Reply…; `bb waiting edit` and

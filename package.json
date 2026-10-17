@@ -1,6 +1,6 @@
 {
   "name": "bb-plugin-waiting",
-  "version": "0.2.0",
+  "version": "0.3.0",
   "type": "module",
   "engines": {
     "bb": ">=0.46",
@@ -8,7 +8,7 @@
   },
   "bb": {
     "name": "Waiting on you",
-    "description": "What is ready for you, each item with its link, as a card above the composer (\"Waiting on you · 3\") and an overview on the home screen. Answer a question right there, say \"Do now\", put it off for later, move it up next, or tick it done. Agents add items with `bb waiting` or the waiting_* tools.",
+    "description": "What is ready for you, each item with its link, as a card above the composer (\"Waiting on you · 3\") and an overview on the home screen. Answer a question right there (the answer is kept for the agent, not sent), send all answers in one message when you want, say \"Do now\", put it off for later, move it up next, or tick it done. Agents read answers with `bb waiting answers` or the waiting_* tools.",
     "branding": {
       "icon": "./assets/icon.svg"
     },

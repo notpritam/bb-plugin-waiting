@@ -6,15 +6,20 @@
 // tools. Every write publishes a realtime signal so open cards refetch, and
 // rewrites the thread's answers file.
 //
-// From the card the user can tick an item done, answer a question (its
-// choices as buttons; the answer is KEPT for the thread's agent, not sent),
-// send every kept answer to the thread in one message ("Send answers"), say
-// "Do now" (sent at once, the thread's agent goes ahead), put it off for
-// later, or move it up next.
+// An item with choices opens as a question in its thread, in bb's own
+// question menu above the composer (where AskUserQuestion's questions open),
+// drawn the way bb draws them (app.tsx). The answer is KEPT for the thread's
+// agent, not sent. Cancel hands the item back to the card, whose "Answer"
+// opens the question again.
+//
+// From the card the user can tick an item done, send every kept answer to
+// the thread in one message ("Send answers"), say "Do now" (sent at once,
+// the thread's agent goes ahead), put it off for later, or move it up next.
 //
 // The answers file: `waiting-on-you.md` in the thread's storage folder (the
 // agent's $BB_THREAD_STORAGE), or under this plugin's data folder when the
 // thread storage can't be written.
+import { AsyncLocalStorage } from "node:async_hooks";
 import { mkdir, writeFile } from "node:fs/promises";
 import { dirname, join } from "node:path";
 import {
@@ -27,6 +32,7 @@ import {
 import { z } from "zod";
 import {
   ANSWERS_FILE_NAME,
+  linkSchema,
   MAX_CHOICES,
   MAX_CHOICE_LENGTH,
   MIGRATIONS,
@@ -67,6 +73,44 @@ export const actionSchema = z.discriminatedUnion("kind", [
 ]);
 export type ItemAction = z.infer<typeof actionSchema>;
 
+/** The question form app.tsx registers for bb's question menu (R-385). */
+export const QUESTION_RENDERER = "waiting-question";
+
+/** At most this many of a thread's items in one question set, as bb's own. */
+export const MAX_QUESTIONS = 10;
+
+/** One item, as the question form shows it. */
+export const questionSchema = z.object({
+  itemId: z.number().int().positive(),
+  title: z.string(),
+  needed: z.string().nullable(),
+  choices: z.array(z.string()).min(1),
+  links: z.array(linkSchema),
+  project: z.string().nullable(),
+  requirement: z.string().nullable(),
+});
+export type Question = z.infer<typeof questionSchema>;
+
+/** What the question form gets: a thread's open items with choices. */
+export const questionSetSchema = z.object({
+  questions: z.array(questionSchema).min(1).max(MAX_QUESTIONS),
+});
+export type QuestionSet = z.infer<typeof questionSetSchema>;
+
+/** One answer: one of the choices, or the user's own words. */
+export const questionAnswerSchema = z.object({
+  itemId: z.number().int().positive(),
+  answer: z.string().trim().min(1).max(MAX_ANSWER),
+  typed: z.boolean(),
+});
+export type QuestionAnswer = z.infer<typeof questionAnswerSchema>;
+
+/** What the form submits: the questions answered; the rest go back to the card. */
+export const questionSubmissionSchema = z.object({
+  answers: z.array(questionAnswerSchema).max(MAX_QUESTIONS),
+});
+export type QuestionSubmission = z.infer<typeof questionSubmissionSchema>;
+
 export const rpcContract = defineRpcContract({
   list: {
     input: z
@@ -79,6 +123,8 @@ export const rpcContract = defineRpcContract({
       /** Open items, and answered ones whose answer waits for the agent. */
       items: z.array(itemSchema),
       threads: z.record(z.string(), threadInfoSchema),
+      /** Items whose question is open in their thread's question menu. */
+      asking: z.array(z.number().int().positive()),
       /** When the earliest "later" item comes back, so the card can refetch. */
       returnsAt: z.number().nullable(),
     }),
@@ -89,6 +135,11 @@ export const rpcContract = defineRpcContract({
   },
   act: {
     input: z.object({ id: z.number().int().positive(), action: actionSchema }).strict(),
+    output: itemSchema,
+  },
+  /** "Answer" on the card: open a cancelled question in the menu again. */
+  ask: {
+    input: z.object({ id: z.number().int().positive() }).strict(),
     output: itemSchema,
   },
   /** Every kept answer of a thread, sent to it in one message. */
@@ -109,8 +160,26 @@ const THREAD_CACHE_MS = 60_000;
 const FILE_WRITE_TIMEOUT_MS = 5_000;
 /** What the agent is told when the file is in its thread storage. */
 const THREAD_STORAGE_FILE = `$BB_THREAD_STORAGE/${ANSWERS_FILE_NAME}`;
+/** bb keeps a question open at most seven days; then it opens again. */
+const QUESTION_TIMEOUT_MS = 7 * 24 * 60 * 60 * 1000;
+/** bb caps a row label at 80 characters. */
+const MAX_ROW_LABEL = 80;
+/** Closed by bb (not the user) this soon after opening: wait longer before the next try. */
+const QUICK_CLOSE_MS = 10_000;
+const REOPEN_MS = 2_000;
+const REOPEN_SLOW_MS = 60_000;
+/** After this many quick closes in a row, an item's question stays on the card. */
+const MAX_QUICK_CLOSES = 3;
+/** Re-check "later" items at least this often while one is pending. */
+const MAX_RETURN_TIMER_MS = 60 * 60 * 1000;
 
 export default async function plugin(bb: BbPluginApi) {
+  // bb ties a question opened during an agent's tool call to that call: the
+  // agent is told "the result will arrive separately", and the tool's real
+  // result comes later as a message that can start a new turn. Questions
+  // here are the item's, not the tool call's, so they open in the context
+  // the plugin loaded in, outside every tool call.
+  const outsideToolCalls = AsyncLocalStorage.snapshot();
   const db = bb.storage.database();
   bb.storage.migrate(db, [...MIGRATIONS]);
   const store = new WaitingStore(db);
@@ -182,38 +251,67 @@ export default async function plugin(bb: BbPluginApi) {
     clearTimeout(timer);
   }
 
-  /** Every write: refetch open cards and rewrite the touched threads' files. */
+  /**
+   * Every write: open or close questions in bb's question menu, refetch open
+   * cards, and rewrite the touched threads' files.
+   */
   async function changed(...threadIds: (string | null)[]): Promise<void> {
+    await syncQuestions();
     bb.realtime.publish(CHANGED, { at: Date.now() });
     await syncFiles(threadIds);
   }
 
   // Threads with something waiting get their file on load, so the path in
-  // the instructions exists before the first change.
+  // the instructions exists before the first change; open items with
+  // choices get their question.
   const startup = setTimeout(() => {
+    void syncQuestions().then(() => bb.realtime.publish(CHANGED, { at: Date.now() }));
     void syncFiles(store.activeThreadIds());
   }, 1_000);
 
   // ---- bb lookups (thread title, project name) ---------------------------
 
-  const threadCache = new Map<string, { info: ThreadInfo; at: number }>();
-  async function threadInfo(threadId: string): Promise<ThreadInfo> {
+  interface ThreadLookup {
+    info: ThreadInfo;
+    /** Archived, deleted or not found: no question opens there. */
+    closed: boolean;
+    at: number;
+  }
+  const threadCache = new Map<string, ThreadLookup>();
+  async function lookUpThread(threadId: string): Promise<ThreadLookup> {
     const cached = threadCache.get(threadId);
-    if (cached !== undefined && Date.now() - cached.at < THREAD_CACHE_MS) {
-      return cached.info;
-    }
-    let info: ThreadInfo = { title: null, projectId: null };
+    if (cached !== undefined && Date.now() - cached.at < THREAD_CACHE_MS) return cached;
+    let lookup: ThreadLookup = {
+      info: { title: null, projectId: null },
+      closed: false,
+      at: Date.now(),
+    };
     try {
-      const thread = await bb.sdk.threads.get({ threadId });
-      info = {
-        title: typeof thread.title === "string" ? thread.title : null,
-        projectId: typeof thread.projectId === "string" ? thread.projectId : null,
+      const thread = (await bb.sdk.threads.get({ threadId })) as {
+        title?: unknown;
+        projectId?: unknown;
+        archivedAt?: unknown;
+        deletedAt?: unknown;
+      };
+      lookup = {
+        info: {
+          title: typeof thread.title === "string" ? thread.title : null,
+          projectId: typeof thread.projectId === "string" ? thread.projectId : null,
+        },
+        closed: typeof thread.archivedAt === "number" || typeof thread.deletedAt === "number",
+        at: Date.now(),
       };
     } catch (error) {
+      // Not found: a deleted thread gets no question. Anything else: try anyway.
+      if (/\b404\b|not found/iu.test(String(error))) lookup = { ...lookup, closed: true };
       bb.log.debug(`thread ${threadId} lookup failed: ${String(error)}`);
     }
-    threadCache.set(threadId, { info, at: Date.now() });
-    return info;
+    threadCache.set(threadId, lookup);
+    return lookup;
+  }
+
+  async function threadInfo(threadId: string): Promise<ThreadInfo> {
+    return (await lookUpThread(threadId)).info;
   }
 
   async function projectName(projectId: string): Promise<string | null> {
@@ -223,6 +321,284 @@ export default async function plugin(bb: BbPluginApi) {
     } catch {
       return null;
     }
+  }
+
+  // ---- questions in bb's own question menu (R-385) -----------------------
+  //
+  // One question set per thread: its open items with choices (not put off,
+  // not cancelled), as tabs, the way bb shows several questions at once. bb
+  // hides the composer while a question is open, so one set means one
+  // Submit or Cancel brings it back. Submit keeps each answer; anything
+  // left unanswered goes back to the card, like Cancel. When the thread's
+  // items change anywhere else, the set closes and opens again as they are.
+
+  interface OpenQuestions {
+    controller: AbortController;
+    signature: string;
+    itemIds: number[];
+    openedAt: number;
+  }
+  /** By thread. */
+  const questions = new Map<string, OpenQuestions>();
+  /** Threads whose set can't open (archived, deleted, bb refused), by signature: the card keeps them. */
+  const unaskable = new Map<string, string>();
+  /** Sets bb closed right after opening, in a row, by thread. */
+  const quickCloses = new Map<string, number>();
+  let syncing: Promise<void> | null = null;
+  let syncAgain = false;
+  let reopenTimer: ReturnType<typeof setTimeout> | undefined;
+  let returnTimer: ReturnType<typeof setTimeout> | undefined;
+
+  function wantsQuestion(item: Item, now: number): boolean {
+    return (
+      item.status === "open" &&
+      item.threadId !== null &&
+      item.choices.length > 0 &&
+      item.askDismissedAt === null &&
+      (item.laterUntil === null || item.laterUntil <= now)
+    );
+  }
+
+  function toQuestion(item: Item): Question {
+    return {
+      itemId: item.id,
+      title: item.title,
+      needed: item.needed,
+      choices: item.choices,
+      links: item.links,
+      project: item.project,
+      requirement: item.requirement,
+    };
+  }
+
+  function setSignature(items: readonly Item[]): string {
+    return JSON.stringify(items.map(toQuestion));
+  }
+
+  /** The set's header in bb's question menu; each item's title is in the form. */
+  function setTitle(items: readonly Item[]): string {
+    return items.length > 1 ? `Waiting on you · ${items.length} questions` : "Waiting on you";
+  }
+
+  function askedItemIds(): Set<number> {
+    const ids = new Set<number>();
+    for (const open of questions.values()) for (const id of open.itemIds) ids.add(id);
+    return ids;
+  }
+
+  function resync(): void {
+    void syncQuestions().then(() => bb.realtime.publish(CHANGED, { at: Date.now() }));
+  }
+
+  function reopenSoon(delay: number): void {
+    if (disposed) return;
+    if (reopenTimer !== undefined) clearTimeout(reopenTimer);
+    reopenTimer = setTimeout(() => {
+      reopenTimer = undefined;
+      resync();
+    }, delay);
+  }
+
+  /** Items put off for later get their question back when they return. */
+  function scheduleReturn(): void {
+    if (returnTimer !== undefined) clearTimeout(returnTimer);
+    returnTimer = undefined;
+    const at = store.returnsAt(null);
+    if (at === null || disposed) return;
+    const delay = Math.min(Math.max(at - Date.now(), 0) + 500, MAX_RETURN_TIMER_MS);
+    returnTimer = setTimeout(() => {
+      returnTimer = undefined;
+      resync();
+    }, delay);
+  }
+
+  /** Unanswered (Cancel, or left out of a Submit): back to the card, where "Answer" opens it again. */
+  function handBack(itemIds: readonly number[], at: number): void {
+    for (const id of itemIds) {
+      const item = store.get(id);
+      if (item !== null && item.status === "open") store.setAskDismissed(id, at);
+    }
+  }
+
+  async function settleQuestions(
+    threadId: string,
+    entry: OpenQuestions,
+    result: Awaited<ReturnType<typeof bb.ui.requestInput>>,
+  ): Promise<void> {
+    const current = questions.get(threadId) === entry;
+    if (current) questions.delete(threadId);
+    if (disposed) return;
+    const now = Date.now();
+    if (result.outcome === "submitted") {
+      quickCloses.delete(threadId);
+      const parsed = questionSubmissionSchema.safeParse(result.value);
+      const answers = parsed.success ? parsed.data.answers : [];
+      const answered = new Set<number>();
+      for (const { itemId, answer } of answers) {
+        if (!entry.itemIds.includes(itemId)) continue;
+        const item = store.get(itemId);
+        // Kept for the agent (file, instructions, waiting_list); not sent.
+        if (item !== null && item.answer === null) store.answer(itemId, answer, now);
+        answered.add(itemId);
+      }
+      handBack(entry.itemIds.filter((id) => !answered.has(id)), now);
+      await changed(threadId);
+      return;
+    }
+    // Closed because the items changed here: the new set is already open.
+    if (!current) return;
+    switch (result.reason) {
+      case "user":
+        quickCloses.delete(threadId);
+        handBack(entry.itemIds, now);
+        await changed(threadId);
+        return;
+      case "plugin-disposed":
+        return;
+      case "thread-deleted":
+        unaskable.set(threadId, entry.signature);
+        bb.realtime.publish(CHANGED, { at: now });
+        return;
+      default: {
+        // Timed out, bb restarted, the thread was stopped: open it again.
+        const quick = now - entry.openedAt < QUICK_CLOSE_MS;
+        const count = quick ? (quickCloses.get(threadId) ?? 0) + 1 : 0;
+        quickCloses.set(threadId, count);
+        if (count >= MAX_QUICK_CLOSES) {
+          bb.log.warn(`${threadId}: its questions keep closing (${result.reason}); they stay on the card`);
+          unaskable.set(threadId, entry.signature);
+          bb.realtime.publish(CHANGED, { at: now });
+          return;
+        }
+        reopenSoon(quick ? REOPEN_SLOW_MS : REOPEN_MS);
+      }
+    }
+  }
+
+  function describeSubmission(items: readonly Item[], value: unknown) {
+    const parsed = questionSubmissionSchema.safeParse(value);
+    if (!parsed.success) return {};
+    const answers = new Map(parsed.data.answers.map((entry) => [entry.itemId, oneLine(entry.answer)]));
+    const only = items.length === 1 ? answers.get(items[0]?.id ?? 0) : undefined;
+    const title =
+      only !== undefined
+        ? `Answered: ${only}`
+        : `Answered ${answers.size} of ${items.length}`;
+    const lines = items.map((item) => {
+      const answer = answers.get(item.id);
+      return `- **${oneLine(item.title)}**: ${answer ?? "back on the card, unanswered"}`;
+    });
+    return {
+      title: title.slice(0, MAX_ROW_LABEL),
+      detail: `${lines.join("\n")}\n\nKept for this thread's agent, not sent.`,
+    };
+  }
+
+  function openQuestions(threadId: string, items: Item[], signature: string): void {
+    const controller = new AbortController();
+    const entry: OpenQuestions = {
+      controller,
+      signature,
+      itemIds: items.map((item) => item.id),
+      openedAt: Date.now(),
+    };
+    questions.set(threadId, entry);
+    const payload: QuestionSet = { questions: items.map(toQuestion) };
+    let pending: Promise<Awaited<ReturnType<typeof bb.ui.requestInput>>>;
+    try {
+      pending = outsideToolCalls(() =>
+        bb.ui.requestInput(
+        {
+          threadId,
+          rendererId: QUESTION_RENDERER,
+          title: setTitle(items),
+          payload,
+          timeoutMs: QUESTION_TIMEOUT_MS,
+          presentation: { label: { pending: "Waiting on you", completed: "Answered" } },
+          describeSubmission: (value) => describeSubmission(items, value),
+        },
+        { signal: controller.signal },
+        ),
+      );
+    } catch (error) {
+      pending = Promise.reject(error);
+    }
+    pending.then(
+      (result) => settleQuestions(threadId, entry, result),
+      (error: unknown) => {
+        if (questions.get(threadId) === entry) questions.delete(threadId);
+        if (disposed) return;
+        bb.log.warn(`questions not opened in ${threadId}: ${String(error)}`);
+        unaskable.set(threadId, signature);
+        bb.realtime.publish(CHANGED, { at: Date.now() });
+      },
+    );
+  }
+
+  /** Open each thread's set as it should be, close the rest. Never throws. */
+  function syncQuestions(): Promise<void> {
+    if (syncing !== null) {
+      syncAgain = true;
+      return syncing;
+    }
+    syncing = (async () => {
+      do {
+        syncAgain = false;
+        if (disposed) return;
+        const now = Date.now();
+        const wanted = new Map<string, Item[]>();
+        for (const item of store.list({ now })) {
+          if (item.threadId === null || !wantsQuestion(item, now)) continue;
+          const set = wanted.get(item.threadId) ?? [];
+          if (set.length < MAX_QUESTIONS) set.push(item);
+          wanted.set(item.threadId, set);
+        }
+        const signatures = new Map(
+          [...wanted].map(([threadId, items]) => [threadId, setSignature(items)] as const),
+        );
+        for (const [threadId, open] of [...questions]) {
+          if (signatures.get(threadId) !== open.signature) {
+            questions.delete(threadId);
+            open.controller.abort();
+          }
+        }
+        for (const [threadId, signature] of [...unaskable]) {
+          if (signatures.get(threadId) !== signature) unaskable.delete(threadId);
+        }
+        for (const [threadId, items] of wanted) {
+          if (questions.has(threadId)) continue;
+          const signature = signatures.get(threadId) ?? "";
+          if (unaskable.get(threadId) === signature) continue;
+          if ((await lookUpThread(threadId)).closed) {
+            unaskable.set(threadId, signature);
+            continue;
+          }
+          if (disposed) return;
+          if (questions.has(threadId) || signatures.get(threadId) !== signature) continue;
+          openQuestions(threadId, items, signature);
+        }
+        scheduleReturn();
+      } while (syncAgain);
+    })()
+      .catch((error: unknown) => {
+        bb.log.warn(`questions not synced: ${String(error)}`);
+      })
+      .finally(() => {
+        syncing = null;
+      });
+    return syncing;
+  }
+
+  /** "Answer" on the card: the question opens in the menu again. */
+  async function reopenQuestion(id: number): Promise<Item> {
+    const item = store.setAskDismissed(id, null);
+    if (item === null) throw new Error(`No item #${id}`);
+    if (item.threadId !== null) {
+      unaskable.delete(item.threadId);
+      quickCloses.delete(item.threadId);
+    }
+    await changed(item.threadId);
+    return store.get(id) ?? item;
   }
 
   /** Typed links from free-form targets; throws naming the refused ones. */
@@ -351,8 +727,15 @@ export default async function plugin(bb: BbPluginApi) {
       return {
         items,
         threads: await threadsFor(items),
+        asking: (() => {
+          const asked = askedItemIds();
+          return items.filter((item) => asked.has(item.id)).map((item) => item.id);
+        })(),
         returnsAt: store.returnsAt(scope),
       };
+    },
+    ask({ id }) {
+      return reopenQuestion(id);
     },
     async setDone({ id, done }) {
       const item = await markDone(id, done, "user");
@@ -377,7 +760,7 @@ export default async function plugin(bb: BbPluginApi) {
   const choiceOption = {
     type: "string",
     repeatable: true,
-    description: `A short answer the user can tap on the card, e.g. --choice Yes --choice No (up to ${MAX_CHOICES}, ${MAX_CHOICE_LENGTH} characters each)`,
+    description: `A short answer the user can pick; the item opens as a question in the thread's question menu, e.g. --choice Yes --choice No (up to ${MAX_CHOICES}, ${MAX_CHOICE_LENGTH} characters each)`,
     aliases: ["choices", "option"],
   } as const;
 
@@ -611,7 +994,7 @@ export default async function plugin(bb: BbPluginApi) {
         }),
         answers: cliCommand({
           summary:
-            "The user's answers from the card that the agent has not picked up yet; --ack marks them picked up",
+            "The user's answers (from the question menu or the card) that the agent has not picked up yet; --ack marks them picked up",
           options: {
             ack: {
               type: "boolean",
@@ -700,9 +1083,9 @@ export default async function plugin(bb: BbPluginApi) {
   bb.agents.registerTool({
     name: "waiting_add",
     description:
-      "Add an item to the user's \"Waiting on you\" checklist: something ready for them to open, pick, answer or do. Always include the link(s) they need to open, as https:// URLs or thr_… ids (never a local path). When the question has fixed answers, pass choices so they can answer from the card. The current thread is attached automatically.",
+      "Add an item to the user's \"Waiting on you\" checklist: something ready for them to open, pick, answer or do. Always include the link(s) they need to open, as https:// URLs or thr_… ids (never a local path). When the question has fixed answers, pass choices: the item then opens as a question in this thread's question menu, in bb's own format. The current thread is attached automatically.",
     instructions:
-      'When you hand the user something to look at or decide (a review page, a preview, a question with options, a doc to read), add it with waiting_add and its https link. Give choices (e.g. ["Yes", "No"] or ["1", "2", "3"]) whenever the question has fixed answers: they can tap one on the card. A tapped answer is kept for you, not sent as a message: read it with waiting_list (ack: true once you act on it) or in $BB_THREAD_STORAGE/waiting-on-you.md. When their reply answers or resolves an item, call waiting_done with its id.',
+      'When you hand the user something to look at or decide (a review page, a preview, a question with options, a doc to read), add it with waiting_add and its https link. Give choices (e.g. ["Yes", "No"] or ["1", "2", "3"]) whenever the question has fixed answers: the item then opens as a question in this thread\'s question menu (where bb\'s own questions open), and they pick one or type their own. Their answer is kept for you, not sent as a message: read it with waiting_list (ack: true once you act on it) or in $BB_THREAD_STORAGE/waiting-on-you.md. When their reply answers or resolves an item, call waiting_done with its id.',
     presentation: {
       label: {
         pending: "Adding to Waiting on you",
@@ -719,7 +1102,7 @@ export default async function plugin(bb: BbPluginApi) {
       choices: choicesSchema
         .optional()
         .describe(
-          'Short answers they can tap, e.g. ["Yes", "No"] or ["A", "B", "C"]; leave out when the answer is free-form',
+          'Short answers they can pick in the question menu, e.g. ["Yes", "No"] or ["A", "B", "C"]; leave out when the answer is free-form',
         ),
       links: z.array(linkInputSchema).max(MAX_LINKS).optional(),
       project: z
@@ -784,7 +1167,7 @@ export default async function plugin(bb: BbPluginApi) {
   bb.agents.registerTool({
     name: "waiting_list",
     description:
-      "List what is waiting on the user, and the answers they tapped on the card that you have not picked up yet: this thread's items, or every thread's with scope \"all\". Pass ack: true to mark this thread's answers as picked up once you act on them.",
+      "List what is waiting on the user, and the answers they gave (in the question menu or on the card) that you have not picked up yet: this thread's items, or every thread's with scope \"all\". Pass ack: true to mark this thread's answers as picked up once you act on them.",
     presentation: {
       label: {
         pending: "Reading Waiting on you",
@@ -828,7 +1211,7 @@ export default async function plugin(bb: BbPluginApi) {
       } else if (pending.length > 0) {
         lines.push(
           "",
-          `${pending.length} ${pending.length === 1 ? "answer" : "answers"} from the card not picked up yet: ${pending.map(answerLine).join("; ")}. Act on them, then call waiting_list with ack: true.`,
+          `${pending.length} ${pending.length === 1 ? "answer" : "answers"} from the user not picked up yet: ${pending.map(answerLine).join("; ")}. Act on them, then call waiting_list with ack: true.`,
         );
       }
       return lines.join("\n");
@@ -852,7 +1235,7 @@ export default async function plugin(bb: BbPluginApi) {
     const sections: string[] = ["Waiting on you (a plugin): the user's checklist for this thread."];
     if (answers.length > 0) {
       sections.push(
-        "Answers since you last looked (the user tapped them on the card; they are kept for you, not sent as messages):",
+        "Answers since you last looked (the user gave them in the question menu or on the card; they are kept for you, not sent as messages):",
         answers
           .slice(0, 20)
           .map(
@@ -901,6 +1284,10 @@ export default async function plugin(bb: BbPluginApi) {
   bb.onDispose(() => {
     disposed = true;
     clearTimeout(startup);
+    if (reopenTimer !== undefined) clearTimeout(reopenTimer);
+    if (returnTimer !== undefined) clearTimeout(returnTimer);
+    for (const open of questions.values()) open.controller.abort();
+    questions.clear();
     threadCache.clear();
   });
 }

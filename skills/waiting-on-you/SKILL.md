@@ -1,6 +1,6 @@
 ---
 name: waiting-on-you
-description: Keep the user's "Waiting on you" checklist (the Waiting on you plugin) with the `bb waiting` CLI or the waiting_add, waiting_done and waiting_list tools, and read the answers they tap on the card (kept in $BB_THREAD_STORAGE/waiting-on-you.md, not sent as messages). Use whenever you hand the user something to open, pick, answer or do, when their reply resolves one, and when you take up an item that may have been answered. Give choices when the question has fixed answers; links must be https or thr_ ids.
+description: Keep the user's "Waiting on you" checklist (the Waiting on you plugin) with the `bb waiting` CLI or the waiting_add, waiting_done and waiting_list tools, and read the answers they give in bb's question menu or on the card (kept in $BB_THREAD_STORAGE/waiting-on-you.md, not sent as messages). Use whenever you hand the user something to open, pick, answer or do, when their reply resolves one, and when you take up an item that may have been answered. Give choices when the question has fixed answers; links must be https or thr_ ids.
 ---
 
 # Waiting on you
@@ -10,17 +10,23 @@ they never dig through the chat for a review page. It shows as a card above
 the composer of the thread it belongs to ("Waiting on you · 3") and, across
 every thread and project, on bb's home screen.
 
-From the card they can: tick an item done; **answer** a question by tapping
-one of its choices; send all their answers at once (**Send answers**: you get
+An item with **choices** opens as a question in the thread's question menu
+above the composer, where bb's own questions open, drawn the same way: one
+row per choice with its number key, "Other…" to type their own answer, Cancel
+and Submit answer. A thread's items with choices share one set, as tabs
+("1 of 3"). Submit keeps each answer for you; Cancel, and any item left
+unanswered, go back to the card, whose **Answer** opens it again. While the
+question is open bb hides the composer, so keep it to what needs their pick.
+
+From the card they can: tick an item done; send all their answers at once (**Send answers**: you get
 one message, `Answers: #12 "Keep the handle?": Yes; #14 "Pick a grid": 2`);
 say **Do now** (you get `Re #12 "…": do it now, go ahead.`; the item leaves
 the card and your instructions tell you to finish it and call
 `waiting_done`); put it off for **Later** (hidden until then); move it up
 **Next**; or **Reply…** in the composer (you get `Re #12 "…": …`).
 
-**A tapped answer is not sent to you.** It is kept, so it never interrupts
-your work: the item shows as answered on the card until you pick the answer
-up. Read the answers:
+**An answer is not sent to you.** It is kept, so it never interrupts your
+work: the item shows as answered on the card until you pick the answer up. Read the answers:
 
 - in `$BB_THREAD_STORAGE/waiting-on-you.md` (rewritten on every change:
   "Answers not picked up yet", then "Waiting on the user", then "Do now"; if
@@ -35,8 +41,8 @@ mentions answering, and before you report back. Act on each answer, then
 sent with Send answers are already picked up.
 
 **The rule:** when you hand the user something to look at or decide, add it here
-with its link. When the answers are fixed, give choices so they can answer from
-the card. Read their answers, act on them, then ack them.
+with its link. When the answers are fixed, give choices so they can answer in
+the question menu. Read their answers, act on them, then ack them.
 
 ## Tools (preferred inside a thread)
 

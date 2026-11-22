@@ -6,11 +6,16 @@
 // 2. A "Waiting on you" section on the home screen with every open item
 //    across threads and projects.
 //
-// Each row: tick it done; tap a choice to answer (the answer is kept for the
-// thread's agent and shows quietly in place; nothing is sent); or, from the
-// row's menu, "Do now", "Next", "Later" (tomorrow, next week, a date) and
-// "Reply…" in the card. The card's "Send answers" sends every kept answer of
-// the thread in one message, when the user wants the agent woken.
+// An item with choices opens as a question in bb's own question menu above
+// the composer (question.tsx), not on the card. Cancel there hands it back:
+// the row shows "Answer", which opens it again. Where no question can open
+// (no thread, or an archived one) its choices stay on the row.
+//
+// Each row: tick it done; or, from the row's menu, "Do now", "Next", "Later"
+// (tomorrow, next week, a date) and "Reply…" in the card. Answers are kept
+// for the thread's agent (nothing is sent); the card's "Send answers" sends
+// every kept answer of the thread in one message, when the user wants the
+// agent woken.
 import {
   useCallback,
   useEffect,
@@ -21,16 +26,16 @@ import {
 } from "react";
 import {
   definePluginApp,
-  experimental_FileLink as FileLink,
   experimental_usePluginId as usePluginId,
-  UrlLink,
   useBbNavigate,
   useComposer,
   useRealtime,
   useRealtimeConnectionState,
   useRpc,
 } from "@get-bb/plugin-sdk/app";
-import type { Item, ItemAction, ItemLink, ThreadInfo, rpcContract } from "./server";
+import type { Item, ItemAction, ThreadInfo, rpcContract } from "./server";
+import { LINK_PILL_CLASS, LinkPill } from "./links";
+import { WaitingQuestion } from "./question";
 import {
   activityRowClass,
   activityTextClass,
@@ -55,13 +60,13 @@ import { cn } from "@/lib/utils";
 
 /** Same channel server.ts publishes on (a value import would pull the server in). */
 const CHANGED = "waiting-changed";
+/** server.ts's QUESTION_RENDERER. */
+const QUESTION_RENDERER = "waiting-question";
 /** Row height bb's composer cards reserve. */
 const CARD_ROW_HEIGHT = 32;
 /** bb's PROMPT_STACK_CARD_HEADER_BUTTON_CLASS. */
 const CARD_HEADER_BUTTON_CLASS =
   "flex min-h-8 w-full min-w-0 cursor-pointer items-center gap-1.5 rounded-none px-3 py-1.5 text-xs text-foreground transition-colors hover:bg-background/80";
-const LINK_PILL_CLASS =
-  "inline-flex h-4 max-w-56 min-w-0 shrink-0 items-center gap-0.5 rounded-full bg-surface-recessed px-1.5 text-2xs leading-none text-subtle-foreground transition-colors hover:text-foreground";
 /** The card header's one action, "Send answers": small, outlined. */
 const HEADER_ACTION_CLASS =
   "mr-2 inline-flex h-5 shrink-0 items-center gap-1 rounded-md border border-border bg-background px-1.5 text-2xs font-medium leading-none text-foreground transition-colors hover:bg-state-hover disabled:pointer-events-none disabled:opacity-50";
@@ -81,6 +86,8 @@ const LATER_HOUR = 9;
 interface WaitingData {
   items: Item[];
   threads: Record<string, ThreadInfo>;
+  /** Items whose question is open in their thread's question menu. */
+  asking: number[];
   returnsAt: number | null;
 }
 
@@ -137,7 +144,9 @@ function useWaitingItems(threadId: string | null) {
     (forThread: string) => settle(rpc.call("sendAnswers", { threadId: forThread })),
     [rpc, settle],
   );
-  return { data, setDone, act, sendAnswers };
+  /** "Answer": open a cancelled question in bb's question menu again. */
+  const ask = useCallback((id: number) => settle(rpc.call("ask", { id })), [rpc, settle]);
+  return { data, setDone, act, sendAnswers, ask };
 }
 
 /** Answered on the card; the thread's agent hasn't picked it up yet. */
@@ -188,7 +197,12 @@ function useFoldAway() {
   return { ticked, fold, unfold };
 }
 
-type RowAction = ItemAction | { kind: "done"; done: boolean } | { kind: "reply" };
+type RowAction =
+  | ItemAction
+  | { kind: "done"; done: boolean }
+  | { kind: "reply" }
+  /** "Answer": the item's question, in bb's question menu. */
+  | { kind: "ask" };
 
 const FAILED = "Didn't go through. Try again, or reply in the thread.";
 
@@ -199,6 +213,7 @@ const FAILED = "Didn't go through. Try again, or reply in the thread.";
 function useRowActions(
   setDone: (id: number, done: boolean) => Promise<void>,
   act: (id: number, action: ItemAction) => Promise<void>,
+  ask: (item: Item) => Promise<void>,
   reply?: (item: Item) => void,
 ) {
   const { ticked, fold, unfold } = useFoldAway();
@@ -242,9 +257,12 @@ function useRowActions(
         case "reply":
           reply?.(item);
           return;
+        case "ask":
+          void run(item.id, () => ask(item));
+          return;
       }
     },
-    [act, fold, reply, run, setDone, unfold],
+    [act, ask, fold, reply, run, setDone, unfold],
   );
   return { ticked, errors, answering, onAct };
 }
@@ -324,70 +342,6 @@ function fromDateInput(value: string): number | null {
     LATER_HOUR,
   );
   return Number.isNaN(date.getTime()) ? null : date.getTime();
-}
-
-function linkLabel(link: ItemLink): string {
-  if (link.label !== null && link.label !== "") return link.label;
-  switch (link.kind) {
-    case "url": {
-      try {
-        const url = new URL(link.url);
-        const text = `${url.host}${url.pathname.replace(/\/$/u, "")}${url.search}`;
-        return text.length > 48 ? `${text.slice(0, 45)}…` : text;
-      } catch {
-        return link.url;
-      }
-    }
-    case "file": {
-      const parts = link.path.split("/").filter((part) => part !== "");
-      const tail = parts.slice(-2).join("/");
-      return tail === "" ? link.path : tail;
-    }
-    case "thread":
-      return "thread";
-  }
-}
-
-function LinkPill({ link }: { link: ItemLink }) {
-  const navigate = useBbNavigate();
-  const label = linkLabel(link);
-  const inner = (
-    <>
-      <span className="min-w-0 truncate">{label}</span>
-      <Icon name="ArrowUpRight" className="size-2.5 shrink-0" aria-hidden="true" />
-    </>
-  );
-  switch (link.kind) {
-    case "url":
-      return (
-        <UrlLink href={link.url} className={LINK_PILL_CLASS} title={link.url}>
-          {inner}
-        </UrlLink>
-      );
-    case "file":
-      // Added before links had to open on the web: flag it, quietly.
-      return (
-        <FileLink
-          target={{ kind: "host", hostId: link.hostId, path: link.path }}
-          className={cn(LINK_PILL_CLASS, "text-destructive-text")}
-          title={`${link.path}: a file on the host, which doesn't open on the web. Ask the agent for an https link.`}
-        >
-          <Icon name="TriangleAlert" fallback="Info" className="size-2.5 shrink-0" aria-hidden="true" />
-          {inner}
-        </FileLink>
-      );
-    case "thread":
-      return (
-        <button
-          type="button"
-          className={LINK_PILL_CLASS}
-          title={link.threadId}
-          onClick={() => navigate.toThread(link.threadId)}
-        >
-          {inner}
-        </button>
-      );
-  }
 }
 
 function ThreadPill({ threadId, title }: { threadId: string; title: string | null }) {
@@ -498,6 +452,20 @@ function RowMenu({
   );
 }
 
+/**
+ * Where an item's choices are: open in its thread's question menu, handed
+ * back with Cancel (the row offers "Answer"), or on the row itself where no
+ * question can open (no thread, an archived one).
+ */
+type ChoicesPlace = "menu" | "cancelled" | "row";
+
+function choicesPlace(item: Item, asking: ReadonlySet<number>): ChoicesPlace | null {
+  if (item.choices.length === 0 || item.status !== "open") return null;
+  if (asking.has(item.id)) return "menu";
+  if (item.askDismissedAt !== null && item.threadId !== null) return "cancelled";
+  return "row";
+}
+
 function ItemRow({
   item,
   ticked,
@@ -505,6 +473,7 @@ function ItemRow({
   answering,
   onAct,
   canReply,
+  choices,
   thread,
 }: {
   item: Item;
@@ -514,6 +483,7 @@ function ItemRow({
   answering: string | undefined;
   onAct: (action: RowAction) => void;
   canReply: boolean;
+  choices: ChoicesPlace | null;
   /** Shown only on the overview, where items come from many threads. */
   thread?: { id: string; title: string | null };
 }) {
@@ -582,20 +552,35 @@ function ItemRow({
           {item.links.map((link, index) => (
             <LinkPill key={`${item.id}-${index}`} link={link} />
           ))}
-          {answered
-            ? null
-            : item.choices.map((choice) => (
-                <button
-                  key={choice}
-                  type="button"
-                  disabled={ticked}
-                  className={CHOICE_PILL_CLASS}
-                  title={`Answer "${choice}"; it is kept for the thread's agent`}
-                  onClick={() => onAct({ kind: "answer", answer: choice })}
-                >
-                  {choice}
-                </button>
-              ))}
+          {answered || choices === null ? null : choices === "row" ? (
+            item.choices.map((choice) => (
+              <button
+                key={choice}
+                type="button"
+                disabled={ticked}
+                className={CHOICE_PILL_CLASS}
+                title={`Answer "${choice}"; it is kept for the thread's agent`}
+                onClick={() => onAct({ kind: "answer", answer: choice })}
+              >
+                {choice}
+              </button>
+            ))
+          ) : choices === "cancelled" || thread !== undefined ? (
+            <button
+              type="button"
+              disabled={ticked}
+              className={CHOICE_PILL_CLASS}
+              title={
+                choices === "menu"
+                  ? "Its question is open in the thread: go there to answer"
+                  : "Open its question again, above the composer"
+              }
+              onClick={() => onAct({ kind: "ask" })}
+            >
+              <Icon name="MessageQuestion" fallback="Info" className="mr-0.5 size-2.5" aria-hidden="true" />
+              Answer
+            </button>
+          ) : null}
           {error === undefined ? null : (
             <span role="alert" className="text-2xs text-destructive">
               {error}
@@ -689,7 +674,7 @@ function WaitingCard() {
   const composer = useComposer();
   const threadId = composer.scope.kind === "thread" ? composer.scope.threadId : null;
   const pluginId = usePluginId();
-  const { data, setDone, act, sendAnswers } = useWaitingItems(threadId);
+  const { data, setDone, act, sendAnswers, ask } = useWaitingItems(threadId);
   // "Reply…" starts the answer in this thread's composer.
   const reply = useCallback(
     (item: Item) => {
@@ -699,12 +684,15 @@ function WaitingCard() {
     },
     [composer],
   );
-  const { ticked, errors, answering, onAct } = useRowActions(setDone, act, reply);
+  const askHere = useCallback((item: Item) => ask(item.id), [ask]);
+  const { ticked, errors, answering, onAct } = useRowActions(setDone, act, askHere, reply);
   const [isExpanded, setExpanded] = useStoredExpanded(`${pluginId}:card-expanded`);
   const focus = useDisclosureFocusHandoff(isExpanded, () => setExpanded(!isExpanded));
   const [sending, setSending] = useState(false);
   const [sendError, setSendError] = useState<string | null>(null);
-  const items = data?.items ?? [];
+  const asking = new Set(data?.asking ?? []);
+  // What is open in bb's question menu right below is not repeated here.
+  const items = (data?.items ?? []).filter((item) => choicesPlace(item, asking) !== "menu");
   if (threadId === null || items.length === 0) return null;
   const bodyId = `waiting-card-body-${threadId}`;
   const toggleId = `waiting-card-toggle-${threadId}`;
@@ -782,6 +770,7 @@ function WaitingCard() {
               answering={answering.get(item.id)}
               onAct={(action) => onAct(item, action)}
               canReply
+              choices={choicesPlace(item, asking)}
             />
           ))}
         </ul>
@@ -808,8 +797,19 @@ function groupByProject(items: readonly Item[]): [string, Item[]][] {
 }
 
 function Overview() {
-  const { data, setDone, act } = useWaitingItems(null);
-  const { ticked, errors, answering, onAct } = useRowActions(setDone, act);
+  const { data, setDone, act, ask } = useWaitingItems(null);
+  const navigate = useBbNavigate();
+  const asking = new Set(data?.asking ?? []);
+  // "Answer" goes to the item's thread, where its question opens.
+  const askThere = useCallback(
+    async (item: Item) => {
+      if (item.threadId === null) return;
+      if (item.askDismissedAt !== null) await ask(item.id);
+      navigate.toThread(item.threadId);
+    },
+    [ask, navigate],
+  );
+  const { ticked, errors, answering, onAct } = useRowActions(setDone, act, askThere);
   if (data === null) return null;
   if (data.items.length === 0) {
     return (
@@ -836,6 +836,7 @@ function Overview() {
                 answering={answering.get(item.id)}
                 onAct={(action) => onAct(item, action)}
                 canReply={false}
+                choices={choicesPlace(item, asking)}
                 thread={
                   item.threadId === null
                     ? undefined
@@ -864,4 +865,6 @@ export default definePluginApp((app) => {
     title: "Waiting on you",
     component: Overview,
   });
+  // An item with choices: its question, in bb's own question menu (R-385).
+  app.slots.pendingInteraction({ id: QUESTION_RENDERER, component: WaitingQuestion });
 });

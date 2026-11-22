@@ -2,8 +2,9 @@
 
 A bb plugin that keeps a check-mark list of what is ready for you: a review
 page to open, a pick to make, a yes or no. Each item carries its link, so you
-never dig through a chat to find it. Answer right on the card: the answer is
-kept for the thread's agent, so tapping it never interrupts the agent's work.
+never dig through a chat to find it. A question with choices opens in bb's
+own question menu above the composer, drawn the way bb draws its questions;
+the answer is kept for the thread's agent, so it never interrupts its work.
 
 ## Where it shows
 
@@ -14,15 +15,25 @@ kept for the thread's agent, so tapping it never interrupts the agent's work.
 - **On the home screen**, a "Waiting on you" section with everything open
   across threads and projects, grouped by product, each with a link to its
   thread.
+- **In bb's question menu** (0.4.0): an item with choices opens as a question
+  in its thread, where bb's own questions (AskUserQuestion) open, in the same
+  form: one row per choice with its number key, "Other…" to type your own
+  answer (voice input included), Cancel and Submit answer. A thread's items
+  with choices share one set, as tabs ("1 of 3", Back, Next). bb hides the
+  composer while it is open; Submit or Cancel brings it back. Items in the
+  menu don't repeat on the card.
 
 ## What you can do with an item
 
 - **Tick it** done; it folds away.
-- **Answer it**: a question's choices (`Yes` `No`, `1` `2` `3`, `A` `B` `C`)
-  sit on the row as small buttons. Tap one and the answer is **kept, not
-  sent**: the row stays where it was, ticked, with your answer beside it,
+- **Answer it** in the question menu: pick a choice (`Yes` `No`, `1` `2` `3`)
+  or type under "Other…", then Submit answer. The answer is **kept, not
+  sent**: the item shows on the card, ticked, with your answer beside it,
   until the thread's agent picks it up (it reads the answers file or its
-  tools, below). Untick it to take the answer back.
+  tools, below). Untick it to take the answer back. **Cancel** (or leaving
+  an item unanswered in a Submit) puts it back on the card with **Answer**,
+  which opens it in the menu again. Where no question can open (an item with
+  no thread, or an archived thread) the choices stay on the row as buttons.
 - **Send answers** (on the card, when there are answers): sends every answer
   of that thread to its agent in **one** message
   (`Answers: #12 "Keep the handle?": Yes; #14 "Pick a grid": 2`), for when

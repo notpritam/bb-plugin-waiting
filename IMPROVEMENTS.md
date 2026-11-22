@@ -26,6 +26,21 @@ Nothing open.
 
 ## Done
 
+- [x] **Choices open in bb's own question menu** (v0.4.0, 2026-11-22, R-385):
+  an open item with choices opens as a question in its thread, in the slot
+  above the composer where bb's own questions open, drawn the way bb draws
+  them (option rows with number keys, "Other…" with voice input, Cancel and
+  Submit answer; several items as tabs, "1 of 3", Back and Next). One set
+  per thread, since bb hides the composer while a question is open. Submit
+  keeps each answer (not sent); Cancel and unanswered items go back to the
+  card, whose "Answer" opens them again; items in the menu don't repeat on
+  the card. The set follows the items: ticked off, put off, edited or
+  removed anywhere, it closes or opens again as they are; it reopens after
+  bb's seven-day limit or a restart. Questions open outside agent tool calls
+  (bb would otherwise detach the call that opened one). No question for an
+  item with no thread or an archived or deleted one: its choices stay on
+  the row.
+
 - [x] **Answers are kept, not sent** (v0.3.0, 2026-10-17, R-105): tapping a
   choice keeps the answer (who, item, choice, time) and ticks the item as
   answered; nothing is sent. The answer shows quietly in place on the card

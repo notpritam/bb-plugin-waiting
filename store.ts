@@ -42,7 +42,7 @@ export const itemSchema = z.object({
   title: z.string(),
   needed: z.string().nullable(),
   links: z.array(linkSchema),
-  /** Short answers the user can tap on the card, e.g. ["Yes", "No"]. */
+  /** Short answers, e.g. ["Yes", "No"]: they open as a question in bb's question menu. */
   choices: z.array(z.string()),
   threadId: z.string().nullable(),
   projectId: z.string().nullable(),
@@ -64,6 +64,11 @@ export const itemSchema = z.object({
   createdAt: z.number(),
   doneAt: z.number().nullable(),
   doneBy: doneBySchema.nullable(),
+  /**
+   * When the user pressed Cancel on its question in bb's question menu: it
+   * waits on the card ("Answer" opens it again) instead of in the menu.
+   */
+  askDismissedAt: z.number().nullable(),
 });
 export type Item = z.infer<typeof itemSchema>;
 
@@ -95,6 +100,8 @@ export const MIGRATIONS: readonly string[] = [
   `ALTER TABLE items ADD COLUMN sent_at INTEGER`,
   // Answers given before 0.3.0 were sent to their thread at once.
   `UPDATE items SET answered_at = done_at, sent_at = done_at, picked_up_at = done_at WHERE answer IS NOT NULL`,
+  // 0.4.0 — an item with choices opens as a question in bb's own question menu.
+  `ALTER TABLE items ADD COLUMN ask_dismissed_at INTEGER`,
 ];
 
 interface ItemRow {
@@ -117,6 +124,7 @@ interface ItemRow {
   created_at: number;
   done_at: number | null;
   done_by: string | null;
+  ask_dismissed_at: number | null;
 }
 
 function parseJsonArray<T>(raw: string, schema: z.ZodType<T[]>): T[] {
@@ -151,6 +159,7 @@ function rowToItem(row: ItemRow): Item {
     createdAt: row.created_at,
     doneAt: row.done_at,
     doneBy: doneBy.success ? doneBy.data : null,
+    askDismissedAt: row.ask_dismissed_at ?? null,
   };
 }
 
@@ -276,7 +285,8 @@ export class WaitingStore {
     if (existing === null) return null;
     this.db
       .prepare(
-        `UPDATE items SET title = ?, needed = ?, links = ?, choices = ? WHERE id = ?`,
+        `UPDATE items SET title = ?, needed = ?, links = ?, choices = ?, ask_dismissed_at = NULL
+         WHERE id = ?`,
       )
       .run(
         patch.title ?? existing.title,
@@ -310,7 +320,7 @@ export class WaitingStore {
       this.db
         .prepare(
           `UPDATE items SET status = 'open', done_at = NULL, done_by = NULL, answer = NULL,
-             answered_at = NULL, picked_up_at = NULL, sent_at = NULL
+             answered_at = NULL, picked_up_at = NULL, sent_at = NULL, ask_dismissed_at = NULL
            WHERE id = ?`,
         )
         .run(id);
@@ -393,6 +403,17 @@ export class WaitingStore {
     const existing = this.get(id);
     if (existing === null) return null;
     this.db.prepare(`UPDATE items SET later_until = ? WHERE id = ?`).run(until, id);
+    return this.get(id);
+  }
+
+  /**
+   * Cancel on its question in bb's question menu (a time), or "Answer" on the
+   * card to open it there again (null).
+   */
+  setAskDismissed(id: number, at: number | null): Item | null {
+    const existing = this.get(id);
+    if (existing === null) return null;
+    this.db.prepare(`UPDATE items SET ask_dismissed_at = ? WHERE id = ?`).run(at, id);
     return this.get(id);
   }
 

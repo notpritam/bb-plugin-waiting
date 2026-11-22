@@ -1,3 +1,4 @@
+import { AsyncLocalStorage } from "node:async_hooks";
 import { existsSync, readFileSync } from "node:fs";
 import { dirname, join } from "node:path";
 import Database from "better-sqlite3";
@@ -30,7 +31,10 @@ interface WrittenFile {
   createParents?: boolean;
 }
 
-async function host(options: { storage?: "ok" | "fails" } = {}) {
+/** Stands in for bb's record of the agent tool call that is running. */
+const activeToolCall = new AsyncLocalStorage<string>();
+
+async function host(options: { storage?: "ok" | "fails"; archived?: boolean } = {}) {
   const sent: SentMessage[] = [];
   const files: WrittenFile[] = [];
   const created = createFakePluginHost({
@@ -42,6 +46,7 @@ async function host(options: { storage?: "ok" | "fails" } = {}) {
           title: "FoundKeep HQ",
           projectId: "proj_1",
           environmentId: "env_1",
+          archivedAt: options.archived === true ? 1_700_000_000_000 : null,
         }),
         send: async (args: SentMessage) => {
           sent.push(args);
@@ -61,18 +66,30 @@ async function host(options: { storage?: "ok" | "fails" } = {}) {
       projects: { get: async () => ({ id: "proj_1", name: "FoundKeep" }) },
     },
   });
+  // bb detaches the running tool call when a question opens inside it; record
+  // which tool call (if any) each question opened in.
+  const openedInToolCall: (string | undefined)[] = [];
+  const requestInput = created.bb.ui.requestInput.bind(created.bb.ui);
+  created.bb.ui.requestInput = (request, requestOptions) => {
+    openedInToolCall.push(activeToolCall.getStore());
+    return requestInput(request, requestOptions);
+  };
   await plugin(created.bb);
   /** The latest content written to a thread's answers file in thread storage. */
   const fileFor = (threadId: string) =>
     files.filter((file) => file.path === `/srv/bb/thread-storage/${threadId}/waiting-on-you.md`).at(-1)
       ?.content ?? null;
-  return { ...created, sent, files, fileFor };
+  return { ...created, sent, files, fileFor, openedInToolCall };
 }
 
 const ctx = { threadId: "thr_1", projectId: "proj_1" };
 
+/** Let the plugin's follow-ups to a settled question run. */
+const flush = () => new Promise((resolve) => setTimeout(resolve, 20));
+
 interface ListResult {
   items: Item[];
+  asking: number[];
   returnsAt: number | null;
 }
 
@@ -97,6 +114,7 @@ function item(overrides: Partial<Item> = {}): Item {
     createdAt: 0,
     doneAt: null,
     doneBy: null,
+    askDismissedAt: null,
     ...overrides,
   };
 }
@@ -410,7 +428,7 @@ describe("bb waiting", () => {
       await harness.behavior.callAgentTool("waiting_list", { scope: "thread", includeDone: false, ack: false }, ctx),
     );
     expect(listed).toContain("[x] #1 Delete the old collection? — yes or no [Yes / No] (FoundKeep) → Yes (answered");
-    expect(listed).toContain("1 answer from the card not picked up yet");
+    expect(listed).toContain("1 answer from the user not picked up yet");
     const cliList = await harness.behavior.runCli(["list"], ctx);
     expect(cliList.stdout).toContain("#1 Delete the old collection?");
     expect(cliList.stdout).toContain("→ Yes (answered");
@@ -591,6 +609,164 @@ describe("bb waiting", () => {
 
     const ticked = await harness.behavior.callAgentTool("waiting_done", { id: 1 }, ctx);
     expect(String(ticked)).toContain("[x] #1");
+    await harness.lifecycle.dispose();
+  });
+});
+
+describe("questions in bb's question menu (R-385)", () => {
+  it("opens a thread's items with choices as one question set, and keeps the answers", async () => {
+    const { harness, sent } = await host();
+    await harness.behavior.callAgentTool(
+      "waiting_add",
+      {
+        title: "Delete the old collection?",
+        needed: "yes or no",
+        choices: ["Yes", "No"],
+        links: [{ target: "https://foundkeep.app/a" }],
+        requirement: "R-160",
+      },
+      ctx,
+    );
+    // No choices, no question.
+    await harness.behavior.callAgentTool("waiting_add", { title: "Read the brief" }, ctx);
+    expect(harness.pendingInteractions).toHaveLength(1);
+    expect(harness.pendingInteractions[0]).toMatchObject({
+      threadId: "thr_1",
+      rendererId: "waiting-question",
+      title: "Waiting on you",
+      payload: {
+        questions: [
+          {
+            itemId: 1,
+            title: "Delete the old collection?",
+            needed: "yes or no",
+            choices: ["Yes", "No"],
+            links: [{ kind: "url", url: "https://foundkeep.app/a", label: null }],
+            project: "FoundKeep",
+            requirement: "R-160",
+          },
+        ],
+      },
+    });
+
+    // A second one joins the same set: still one question in the menu.
+    await harness.behavior.callAgentTool("waiting_add", { title: "Pick a grid", choices: ["1", "2"] }, ctx);
+    expect(harness.pendingInteractions).toHaveLength(1);
+    const [set] = harness.pendingInteractions;
+    expect(set!.title).toBe("Waiting on you · 2 questions");
+    expect((set!.payload as { questions: { itemId: number }[] }).questions.map((q) => q.itemId)).toEqual([1, 3]);
+    const card = (await harness.behavior.callRpc("list", { threadId: "thr_1" })) as ListResult;
+    expect(card.asking).toEqual([1, 3]);
+
+    harness.behavior.submitInteraction(set!.id, {
+      answers: [
+        { itemId: 1, answer: "Yes", typed: false },
+        { itemId: 3, answer: "3, but wider", typed: true },
+      ],
+    });
+    await flush();
+    const after = (await harness.behavior.callRpc("list", { threadId: "thr_1" })) as ListResult;
+    expect(after.asking).toEqual([]);
+    expect(after.items.filter((entry) => entry.answer !== null).map((entry) => [entry.id, entry.answer])).toEqual([
+      [1, "Yes"],
+      [3, "3, but wider"],
+    ]);
+    // Kept for the agent, like an answer on the card: nothing is sent.
+    expect(sent).toEqual([]);
+    expect(harness.registrations.instructionProvider?.(ctx)).toContain('- #1 "Delete the old collection?": Yes');
+    expect(harness.pendingInteractions).toHaveLength(0);
+    await harness.lifecycle.dispose();
+  });
+
+  it("hands unanswered items back to the card, and Answer opens them again", async () => {
+    const { harness } = await host();
+    await harness.behavior.callAgentTool("waiting_add", { title: "Ship it?", choices: ["Ship", "Wait"] }, ctx);
+    await harness.behavior.callAgentTool("waiting_add", { title: "Which grid?", choices: ["1", "2"] }, ctx);
+    const [first] = harness.pendingInteractions;
+    // Submit with one answered: the other goes back to the card, the menu closes.
+    harness.behavior.submitInteraction(first!.id, { answers: [{ itemId: 1, answer: "Ship", typed: false }] });
+    await flush();
+    expect(harness.pendingInteractions).toHaveLength(0);
+    const card = (await harness.behavior.callRpc("list", { threadId: "thr_1" })) as ListResult;
+    expect(card.asking).toEqual([]);
+    expect(card.items.find((entry) => entry.id === 2)).toMatchObject({
+      status: "open",
+      askDismissedAt: expect.any(Number),
+    });
+
+    const reopened = await harness.behavior.callRpc("ask", { id: 2 });
+    expect(reopened).toMatchObject({ askDismissedAt: null });
+    expect(harness.pendingInteractions).toHaveLength(1);
+    const [second] = harness.pendingInteractions;
+    expect((second!.payload as { questions: { itemId: number }[] }).questions.map((q) => q.itemId)).toEqual([2]);
+
+    // Cancel: back to the card, unanswered.
+    harness.behavior.cancelInteraction(second!.id);
+    await flush();
+    expect(harness.pendingInteractions).toHaveLength(0);
+    const again = (await harness.behavior.callRpc("list", { threadId: "thr_1" })) as ListResult;
+    expect(again.items.find((entry) => entry.id === 2)).toMatchObject({
+      status: "open",
+      answer: null,
+      askDismissedAt: expect.any(Number),
+    });
+    await harness.lifecycle.dispose();
+  });
+
+  it("follows the items when they are ticked off, put off, edited or removed elsewhere", async () => {
+    const { harness } = await host();
+    await harness.behavior.callAgentTool("waiting_add", { title: "A?", choices: ["Yes", "No"] }, ctx);
+    await harness.behavior.callAgentTool("waiting_add", { title: "B?", choices: ["Yes", "No"] }, ctx);
+    await harness.behavior.callAgentTool("waiting_add", { title: "C?", choices: ["Yes", "No"] }, ctx);
+    const titles = () =>
+      harness.pendingInteractions.flatMap((open) =>
+        (open.payload as { questions: { title: string }[] }).questions.map((q) => q.title),
+      );
+    expect(harness.pendingInteractions).toHaveLength(1);
+    expect(titles()).toEqual(["A?", "B?", "C?"]);
+
+    await harness.behavior.callAgentTool("waiting_done", { id: 1 }, ctx);
+    await flush();
+    expect(titles()).toEqual(["B?", "C?"]);
+    await harness.behavior.callRpc("act", { id: 2, action: { kind: "later", until: Date.now() + 86_400_000 } });
+    await flush();
+    expect(titles()).toEqual(["C?"]);
+    await harness.behavior.runCli(["edit", "3", "--choice", "Yes", "--choice", "No", "--choice", "Later"], ctx);
+    await flush();
+    expect(harness.pendingInteractions).toHaveLength(1);
+    expect(harness.pendingInteractions[0]!.payload).toMatchObject({ questions: [{ choices: ["Yes", "No", "Later"] }] });
+    await harness.behavior.runCli(["remove", "3"], ctx);
+    await flush();
+    expect(harness.pendingInteractions).toHaveLength(0);
+
+    // Back from later: its question opens again.
+    await harness.behavior.callRpc("act", { id: 2, action: { kind: "next" } });
+    expect(titles()).toEqual(["B?"]);
+    await harness.lifecycle.dispose();
+  });
+
+  it("opens questions outside the agent's tool call, so the call returns as usual", async () => {
+    const { harness, openedInToolCall } = await host();
+    const added = await activeToolCall.run("waiting_add", () =>
+      harness.behavior.callAgentTool("waiting_add", { title: "Ship it?", choices: ["Ship", "Wait"] }, ctx),
+    );
+    expect(String(added)).toContain("Added [ ] #1 Ship it?");
+    await activeToolCall.run("waiting_add", () =>
+      harness.behavior.callAgentTool("waiting_add", { title: "Which grid?", choices: ["1", "2"] }, ctx),
+    );
+    await activeToolCall.run("waiting_done", () => harness.behavior.callAgentTool("waiting_done", { id: 1 }, ctx));
+    expect(openedInToolCall.length).toBeGreaterThanOrEqual(3);
+    expect(openedInToolCall.every((call) => call === undefined)).toBe(true);
+    await harness.lifecycle.dispose();
+  });
+
+  it("keeps the choices on the card when the thread is archived", async () => {
+    const { harness } = await host({ archived: true });
+    await harness.behavior.callAgentTool("waiting_add", { title: "Ship it?", choices: ["Ship", "Wait"] }, ctx);
+    expect(harness.pendingInteractions).toHaveLength(0);
+    const card = (await harness.behavior.callRpc("list", { threadId: "thr_1" })) as ListResult;
+    expect(card.asking).toEqual([]);
+    expect(card.items[0]).toMatchObject({ choices: ["Ship", "Wait"], askDismissedAt: null });
     await harness.lifecycle.dispose();
   });
 });

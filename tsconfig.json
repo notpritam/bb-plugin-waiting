@@ -23,6 +23,8 @@
   "include": [
     "server.ts",
     "app.tsx",
+    "question.tsx",
+    "links.tsx",
     "store.ts",
     "components",
     "lib",
